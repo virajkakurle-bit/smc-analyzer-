@@ -11,18 +11,52 @@ CACHE = {}  # (symbol, interval) -> (timestamp, result); protects Binance from m
 
 HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
+BAD = {}  # source name -> time it last failed (skipped for 10 minutes)
+
+def _get(u):
+    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+def _binance(host):
+    def f(sym, iv):
+        raw = _get(f"{host}/api/v3/klines?symbol={sym}&interval={iv}&limit=500")
+        return [dict(t=int(x[0] // 1000), o=float(x[1]), h=float(x[2]), l=float(x[3]), c=float(x[4])) for x in raw]
+    return f
+
+def _bybit(sym, iv):
+    m = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}[iv]
+    raw = _get(f"https://api.bybit.com/v5/market/kline?category=spot&symbol={sym}&interval={m}&limit=500")["result"]["list"]
+    return [dict(t=int(x[0]) // 1000, o=float(x[1]), h=float(x[2]), l=float(x[3]), c=float(x[4])) for x in reversed(raw)]
+
+def _okx(sym, iv):
+    m = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}[iv]
+    inst = sym.replace("USDT", "-USDT")
+    raw = _get(f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar={m}&limit=300")["data"]
+    return [dict(t=int(x[0]) // 1000, o=float(x[1]), h=float(x[2]), l=float(x[3]), c=float(x[4])) for x in reversed(raw)]
+
+def _kraken(sym, iv):
+    m = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}[iv]
+    pair = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "PAXGUSDT": "PAXGUSD"}[sym]
+    res = _get(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={m}")["result"]
+    raw = next(v for k, v in res.items() if k != "last")
+    return [dict(t=int(x[0]), o=float(x[1]), h=float(x[2]), l=float(x[3]), c=float(x[4])) for x in raw]
+
+SOURCES = [("binance", _binance("https://api.binance.com")), ("binance-vision", _binance("https://data-api.binance.vision")),
+           ("bybit", _bybit), ("okx", _okx), ("kraken", _kraken)]
+
 def klines(sym, iv, limit=500):
-    err = None
-    for h in HOSTS:
+    errs = []
+    for name, fn in SOURCES:
+        if time.time() - BAD.get(name, 0) < 600: continue
         try:
-            u = f"{h}/api/v3/klines?symbol={sym}&interval={iv}&limit={limit}"
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                raw = json.load(r)
-            return [dict(t=int(x[0] // 1000), o=float(x[1]), h=float(x[2]), l=float(x[3]), c=float(x[4])) for x in raw]
+            d = fn(sym, iv)
+            if len(d) >= 60: return d
+            raise ValueError("too few candles")
         except Exception as e:
-            err = e
-    raise RuntimeError(f"Data fetch failed: {err}")
+            BAD[name] = time.time(); errs.append(f"{name}: {e}")
+    BAD.clear()
+    raise RuntimeError("All data sources failed -> " + " | ".join(errs))
 
 def swings(d, k=3):
     H, L = [], []
