@@ -17,7 +17,7 @@ def _get(u, t=10):
         return json.load(r)
 
 def mk(t, o, h, l, c, v, b=None):
-    v = float(v or 0)
+    o, h, l, c, v = float(o), float(h), float(l), float(c), float(v or 0)
     if b is None:
         rng = h - l
         b = v * ((c - l) / rng if rng > 0 else 0.5)   # estimate: close position in range
