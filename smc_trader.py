@@ -1,407 +1,710 @@
-#!/usr/bin/env python3
 """
-SMC Lab (educational). Live data -> structure, liquidity, order blocks, FVG, buy/sell zones,
-volume profile, order flow (buy vs sell volume). Standard library only (Python 3.8+).
-Run: python smc_trader.py -> open http://127.0.0.1:8000
-NOT financial advice. Nothing here guarantees profit.
+VK SMC Terminal
+- Data: Bybit (primary) -> OKX (fallback) for crypto, Yahoo for XAUUSD / Gold futures
+- Analysis runs ONLY on closed candles, so zones/POC do not repaint or shift
+- Optional Telegram alerts: set env TG_TOKEN and TG_CHAT_ID (and SCAN, e.g. "BTCUSDT:15m,XAUUSD:15m")
 """
-import json, os, time, urllib.request, urllib.parse, http.server, socketserver, webbrowser
+import os
+import time
+import threading
 
-CACHE, BAD = {}, {}
-TTL = 4  # seconds
-IVS = ("1m", "5m", "15m", "1h", "4h", "1d")
+import requests
+from flask import Flask, jsonify, request, Response
 
-def _get(u, t=10):
-    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=t) as r:
-        return json.load(r)
+app = Flask(__name__)
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
-def mk(t, o, h, l, c, v, b=None):
-    o, h, l, c, v = float(o), float(h), float(l), float(c), float(v or 0)
-    if b is None:
-        rng = h - l
-        b = v * ((c - l) / rng if rng > 0 else 0.5)   # estimate: close position in range
-    return dict(t=int(t), o=float(o), h=float(h), l=float(l), c=float(c), v=v, b=float(b))
+SYMBOLS = {
+    "BTCUSDT": {"name": "Bitcoin", "src": "crypto"},
+    "ETHUSDT": {"name": "Ethereum", "src": "crypto"},
+    "SOLUSDT": {"name": "Solana", "src": "crypto"},
+    "XAUTUSDT": {"name": "Gold token (Bybit, real volume + depth)", "src": "crypto"},
+    "XAUUSD": {"name": "Gold spot (Yahoo, no volume)", "src": "yahoo", "y": "XAUUSD=X"},
+    "GC=F": {"name": "Gold futures (Yahoo, delayed)", "src": "yahoo", "y": "GC=F"},
+}
+TF = {
+    "1m": {"by": "1", "okx": "1m", "yi": "1m", "yr": "5d", "sec": 60},
+    "5m": {"by": "5", "okx": "5m", "yi": "5m", "yr": "30d", "sec": 300},
+    "15m": {"by": "15", "okx": "15m", "yi": "15m", "yr": "30d", "sec": 900},
+    "1h": {"by": "60", "okx": "1H", "yi": "60m", "yr": "180d", "sec": 3600},
+    "4h": {"by": "240", "okx": "4H", "yi": "60m", "yr": "360d", "sec": 14400},
+    "1d": {"by": "D", "okx": "1D", "yi": "1d", "yr": "2y", "sec": 86400},
+}
 
-# ---------- data sources: each returns (candles, exact_buy_sell_split) ----------
-def _binance(host):
-    def f(sym, iv):
-        raw = _get(f"{host}/api/v3/klines?symbol={sym}&interval={iv}&limit=500")
-        return [mk(x[0] // 1000, x[1], x[2], x[3], x[4], x[5], float(x[9])) for x in raw], True
-    return f
+# ---------------------------------------------------------------- data layer
+_cache = {}
 
-def _bybit(sym, iv):
-    m = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}[iv]
-    raw = _get(f"https://api.bybit.com/v5/market/kline?category=spot&symbol={sym}&interval={m}&limit=500")["result"]["list"]
-    return [mk(int(x[0]) // 1000, x[1], x[2], x[3], x[4], x[5]) for x in reversed(raw)], False
 
-def _okx(sym, iv):
-    m = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}[iv]
-    raw = _get(f"https://www.okx.com/api/v5/market/candles?instId={sym.replace('USDT', '-USDT')}&bar={m}&limit=300")["data"]
-    return [mk(int(x[0]) // 1000, x[1], x[2], x[3], x[4], x[5]) for x in reversed(raw)], False
+def _pack(rows):
+    """rows: list of (t,o,h,l,c,v) -> clean sorted arrays"""
+    seen = {}
+    for r in rows:
+        if any(x is None for x in r):
+            continue
+        t, o, h, l, c, v = r
+        if h < l or h <= 0:
+            continue
+        seen[int(t)] = (int(t), float(o), float(h), float(l), float(c), float(v))
+    rows = [seen[k] for k in sorted(seen)]
+    return {k: [r[i] for r in rows] for i, k in enumerate(["t", "o", "h", "l", "c", "v"])}
 
-def _kraken(sym, iv):
-    m = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}[iv]
-    pair = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "PAXGUSDT": "PAXGUSD"}[sym]
-    res = _get(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={m}")["result"]
-    raw = next(v for k, v in res.items() if k != "last")
-    return [mk(x[0], x[1], x[2], x[3], x[4], x[6]) for x in raw], False
 
-def _yahoo(sym, iv):
-    tk = {"XAUUSD": "XAUUSD=X", "GC": "GC=F"}[sym]
-    cfg = {"1m": ("1m", "5d"), "5m": ("5m", "1mo"), "15m": ("15m", "1mo"),
-           "1h": ("60m", "6mo"), "4h": ("60m", "6mo"), "1d": ("1d", "2y")}[iv]
-    j = _get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(tk)}?interval={cfg[0]}&range={cfg[1]}")
-    r = j["chart"]["result"][0]; q = r["indicators"]["quote"][0]; rows = []
-    for i, t in enumerate(r["timestamp"]):
-        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-        if None in (o, h, l, c): continue
-        rows.append([t, o, h, l, c, q["volume"][i] or 0])
-    if iv == "4h":
-        g = {}
-        for t, o, h, l, c, v in rows:
-            k = t - t % 14400
-            if k in g: g[k][2] = max(g[k][2], h); g[k][3] = min(g[k][3], l); g[k][4] = c; g[k][5] += v
-            else: g[k] = [k, o, h, l, c, v]
-        rows = [g[k] for k in sorted(g)]
-    return [mk(*x) for x in rows[-500:]], False
+def fetch_bybit(sym, tf):
+    r = requests.get(
+        "https://api.bybit.com/v5/market/kline",
+        params={"category": "linear", "symbol": sym, "interval": TF[tf]["by"], "limit": 600},
+        headers=UA, timeout=8,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("retCode") != 0:
+        raise RuntimeError("Bybit: %s" % j.get("retMsg"))
+    rows = [(int(x[0]) // 1000, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])) for x in j["result"]["list"]]
+    return _pack(rows)
 
-SRC = {"binance": _binance("https://api.binance.com"), "binance-vision": _binance("https://data-api.binance.vision"),
-       "bybit": _bybit, "okx": _okx, "kraken": _kraken, "yahoo": _yahoo}
-CRYPTO = ["binance", "binance-vision", "bybit", "okx", "kraken"]
-ROUTE = {"BTCUSDT": CRYPTO, "ETHUSDT": CRYPTO, "PAXGUSDT": CRYPTO, "XAUUSD": ["yahoo"], "GC": ["yahoo"]}
 
-def fetch(sym, iv):
-    errs = []
-    for name in ROUTE[sym]:
-        if time.time() - BAD.get((name, sym), 0) < 600: continue
+def fetch_okx(sym, tf):
+    inst = sym[:-4] + "-USDT-SWAP"
+    r = requests.get(
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": inst, "bar": TF[tf]["okx"], "limit": 300},
+        headers=UA, timeout=8,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") != "0":
+        raise RuntimeError("OKX: %s" % j.get("msg"))
+    rows = [(int(x[0]) // 1000, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[6] or x[5])) for x in j["data"]]
+    return _pack(rows)
+
+
+def fetch_yahoo(sym, tf):
+    ysym = SYMBOLS[sym]["y"]
+    last_err = None
+    for host in ("query1", "query2"):
         try:
-            d, exact = SRC[name](sym, iv)
-            if len(d) < 60: raise ValueError("too few candles")
-            novol = sum(x['v'] for x in d) == 0
-            if novol:   # spot FX has no volume: use time-at-price (1 unit per candle)
-                for x in d:
-                    rng = x['h'] - x['l']; x['v'] = 1.0; x['b'] = (x['c'] - x['l']) / rng if rng > 0 else 0.5
-            return d, exact, name, novol
-        except Exception as e:
-            BAD[(name, sym)] = time.time(); errs.append(f"{name}: {e}")
-    for k in [k for k in BAD if k[1] == sym]: BAD.pop(k)
-    raise RuntimeError("All data sources failed -> " + " | ".join(errs))
+            r = requests.get(
+                "https://%s.finance.yahoo.com/v8/finance/chart/%s" % (host, ysym),
+                params={"interval": TF[tf]["yi"], "range": TF[tf]["yr"]},
+                headers=UA, timeout=10,
+            )
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            rows = list(zip(res["timestamp"], q["open"], q["high"], q["low"], q["close"],
+                            [(v or 0) for v in q["volume"]]))
+            cs = _pack(rows)
+            if tf == "4h":
+                cs = resample(cs, 14400)
+            return cs
+        except Exception as e:  # noqa
+            last_err = e
+    raise RuntimeError("Yahoo: %s" % last_err)
 
-# ---------- SMC logic ----------
-def swings(d, k=3):
-    H, L = [], []
-    for i in range(k, len(d) - k):
-        if all(d[i]['h'] > d[i-j]['h'] and d[i]['h'] >= d[i+j]['h'] for j in range(1, k + 1)): H.append(i)
-        if all(d[i]['l'] < d[i-j]['l'] and d[i]['l'] <= d[i+j]['l'] for j in range(1, k + 1)): L.append(i)
-    return H, L
 
-def mirror(d):
-    return [dict(t=x['t'], o=-x['o'], h=-x['l'], l=-x['h'], c=-x['c'], v=x['v'], b=x['v'] - x['b']) for x in d]
+def resample(cs, sec):
+    out = {}
+    for i in range(len(cs["t"])):
+        k = cs["t"][i] // sec * sec
+        if k not in out:
+            out[k] = [k, cs["o"][i], cs["h"][i], cs["l"][i], cs["c"][i], cs["v"][i]]
+        else:
+            b = out[k]
+            b[2] = max(b[2], cs["h"][i])
+            b[3] = min(b[3], cs["l"][i])
+            b[4] = cs["c"][i]
+            b[5] += cs["v"][i]
+    return _pack(list(out.values()))
 
-def eq_levels(vals, tol):
+
+def get_candles(sym, tf):
+    key = (sym, tf)
+    ttl = 2 if SYMBOLS[sym]["src"] == "crypto" else 8
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1], hit[2], hit[3]
+    errors = []
+    if SYMBOLS[sym]["src"] == "crypto":
+        order = [("Bybit", fetch_bybit), ("OKX", fetch_okx)]
+    else:
+        order = [("Yahoo", fetch_yahoo)]
+    for name, fn in order:
+        try:
+            cs = fn(sym, tf)
+            if len(cs["t"]) < 40:
+                raise RuntimeError("only %d candles" % len(cs["t"]))
+            _cache[key] = (time.time(), cs, name, errors)
+            return cs, name, errors
+        except Exception as e:  # noqa
+            errors.append("%s: %s" % (name, str(e)[:140]))
+    if hit:  # serve stale rather than blank
+        return hit[1], hit[2] + " (stale)", errors
+    raise RuntimeError(" | ".join(errors))
+
+
+# ------------------------------------------------------------ analysis layer
+def atr_series(h, l, c, n=14):
+    out, s = [], 0.0
+    for i in range(len(c)):
+        tr = h[i] - l[i] if i == 0 else max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+        if i < n:
+            s += tr
+            out.append(s / (i + 1))
+        else:
+            out.append((out[-1] * (n - 1) + tr) / n)
+    return out
+
+
+def structure(o, h, l, c, at, n):
+    """Confirmed pivots (n candles each side), BOS/CHoCH on candle CLOSE, order blocks."""
+    N = len(c)
+    swings, breaks, obs = [], [], []
+    lastH = lastL = None  # [idx, price, broken]
+    trend = 0
+    for i in range(N):
+        p = i - n
+        if p >= n:
+            if h[p] > max(h[p - n:p]) and h[p] >= max(h[p + 1:p + n + 1]):
+                swings.append((p, "H", h[p]))
+                lastH = [p, h[p], False]
+            if l[p] < min(l[p - n:p]) and l[p] <= min(l[p + 1:p + n + 1]):
+                swings.append((p, "L", l[p]))
+                lastL = [p, l[p], False]
+        if lastH and not lastH[2] and c[i] > lastH[1]:
+            kind = "CHoCH" if trend == -1 else "BOS"
+            trend = 1
+            lastH[2] = True
+            s = min(range(lastH[0], i + 1), key=lambda k: l[k])
+            cands = [k for k in range(s, i) if c[k] < o[k]]
+            k = min(cands, key=lambda k: l[k]) if cands else s
+            top, bot = h[k], l[k]
+            if top - bot > 3 * at[k]:
+                top, bot = o[k], c[k]
+            breaks.append({"i": i, "dir": 1, "kind": kind, "level": lastH[1], "from": lastH[0]})
+            obs.append({"dir": 1, "k": k, "brk": i, "top": top, "bottom": bot})
+        if lastL and not lastL[2] and c[i] < lastL[1]:
+            kind = "CHoCH" if trend == 1 else "BOS"
+            trend = -1
+            lastL[2] = True
+            s = max(range(lastL[0], i + 1), key=lambda k: h[k])
+            cands = [k for k in range(s, i) if c[k] > o[k]]
+            k = max(cands, key=lambda k: h[k]) if cands else s
+            top, bot = h[k], l[k]
+            if top - bot > 3 * at[k]:
+                top, bot = c[k], o[k]
+            breaks.append({"i": i, "dir": -1, "kind": kind, "level": lastL[1], "from": lastL[0]})
+            obs.append({"dir": -1, "k": k, "brk": i, "top": top, "bottom": bot})
+    # mitigation: close through the far side of the zone after the break
+    for z in obs:
+        z["mit"] = False
+        for j in range(z["brk"] + 1, N):
+            if (z["dir"] == 1 and c[j] < z["bottom"]) or (z["dir"] == -1 and c[j] > z["top"]):
+                z["mit"] = True
+                break
+    return swings, breaks, obs, trend
+
+
+def find_fvgs(h, l, c, at, min_mult):
+    N = len(c)
     out = []
-    for a in range(len(vals)):
-        for b in range(a + 1, len(vals)):
-            if abs(vals[a] - vals[b]) <= tol:
-                m = (vals[a] + vals[b]) / 2
-                if not any(abs(m - o) <= tol for o in out): out.append(m)
-    return out[-3:]
+    for i in range(2, N):
+        if l[i] > h[i - 2] and (l[i] - h[i - 2]) >= min_mult * at[i]:
+            z = {"dir": 1, "k": i - 1, "top": l[i], "bottom": h[i - 2], "end": i}
+        elif h[i] < l[i - 2] and (l[i - 2] - h[i]) >= min_mult * at[i]:
+            z = {"dir": -1, "k": i - 1, "top": l[i - 2], "bottom": h[i], "end": i}
+        else:
+            continue
+        z["filled"] = False
+        for j in range(i + 1, N):
+            if (z["dir"] == 1 and c[j] < z["bottom"]) or (z["dir"] == -1 and c[j] > z["top"]):
+                z["filled"] = True
+                break
+        out.append(z)
+    return out
 
-def ob_bull(d):
-    H, L = swings(d)
-    if not L: return None
-    a = L[-1]; lo = max(a - 4, 0); i = a
-    while i >= lo and d[i]['c'] >= d[i]['o']: i -= 1   # last bearish candle near swing low
-    if i < lo: i = a
-    return dict(bot=d[i]['l'], top=d[i]['h'], t=d[i]['t'], a=a)
 
-def bull_fvgs(d):
-    n = len(d); fv = []
-    for j in range(max(0, n - 80), n - 2):
-        if d[j+2]['l'] > d[j]['h'] and all(x['l'] > d[j]['h'] for x in d[j+3:]):
-            fv.append((d[j+2]['l'], d[j]['h'], d[j]['t']))     # top, bottom, time
-    return fv[-3:]
+def sr_levels(swings, N, price, tol, lookback=400):
+    pts = sorted([(p, idx) for idx, _, p in swings if idx >= N - lookback])
+    groups = []
+    for p, idx in pts:
+        if groups and p - groups[-1]["lo"] <= tol:
+            g = groups[-1]
+            g["ps"].append(p)
+            g["first"] = min(g["first"], idx)
+        else:
+            groups.append({"lo": p, "ps": [p], "first": idx})
+    lv = [{"price": sum(g["ps"]) / len(g["ps"]), "touches": len(g["ps"]), "first": g["first"]}
+          for g in groups if len(g["ps"]) >= 2]
+    above = sorted([x for x in lv if x["price"] > price], key=lambda x: x["price"])[:3]
+    below = sorted([x for x in lv if x["price"] <= price], key=lambda x: -x["price"])[:3]
+    return above + below
 
-def long_setup(d, aligned):
-    n = len(d); H, L = swings(d)
-    ob = ob_bull(d)
-    if not L or not H or not ob: return None
-    last = d[-1]['c']; atr = sum(x['h'] - x['l'] for x in d[-14:]) / 14
-    bot, top = ob['bot'], ob['top']
-    if last < bot: return None                       # price already below the zone: invalid
-    entry = top if last > top else last
-    sl = min(bot, d[ob['a']]['l']) - 0.15 * atr
-    if entry - sl <= 0: return None
-    fvg_in = any(f[1] <= top and f[0] >= bot for f in bull_fvgs(d))
-    lv = [d[x]['l'] for x in L[-8:] if x < n - 10]
-    sweep = any(c['l'] < v and c['c'] > v for v in lv for c in d[-10:])
-    above = [d[x]['h'] for x in H[-8:] if d[x]['h'] > entry]
-    liq = min(above) if above else None
-    risk = entry - sl; rr_liq = (liq - entry) / risk if liq else 0
-    reasons, score = [], 0
-    if aligned: score += 1; reasons.append("Trend/structure agrees")
-    if sweep: score += 1; reasons.append("Liquidity below was swept (stop hunt)")
-    if fvg_in: score += 1; reasons.append("FVG overlaps the zone")
-    if rr_liq >= 2: score += 1; reasons.append(f"Liquidity target gives {rr_liq:.1f}R")
-    if last - entry <= 1.5 * atr: score += 1; reasons.append("Price is near the zone")
-    return dict(entry=entry, sl=sl, ob=(bot, top, ob['t']), liq=liq, rr_liq=rr_liq, score=score, reasons=reasons)
 
-def side_plan(d, sign, aligned):
-    s = long_setup(d if sign == 1 else mirror(d), aligned)
-    if not s: return None
-    e, sl, (b, t_, ot), liq = s['entry'], s['sl'], s['ob'], s['liq']
-    if sign == -1: e, sl, b, t_, liq = -e, -sl, -t_, -b, (-liq if liq else None)
-    r = abs(e - sl)
-    return dict(side="BUY" if sign == 1 else "SELL", aligned=aligned, entry=e, sl=sl,
-                tp1=e + sign * r, tp2=e + sign * 2 * r, tp3=e + sign * 3 * r, trail=e + sign * 1.1 * r,
-                liq=liq, rr_liq=s['rr_liq'], score=s['score'], reasons=s['reasons'], ob=dict(top=t_, bot=b, t=ot))
+def fib_leg(swings):
+    if len(swings) < 2:
+        return None
+    last = swings[-1]
+    prev = next((s for s in reversed(swings[:-1]) if s[1] != last[1]), None)
+    if not prev:
+        return None
+    hi = max(last[2], prev[2])
+    lo = min(last[2], prev[2])
+    up = last[1] == "H"
+    rs = [0.382, 0.5, 0.618, 0.786]
+    levels = [{"r": r, "price": (hi - r * (hi - lo)) if up else (lo + r * (hi - lo))} for r in rs]
+    return {"i0": prev[0], "i1": last[0], "up": up, "hi": hi, "lo": lo, "eq": (hi + lo) / 2, "levels": levels}
 
-def vprofile(d, bins=48):
-    lo = min(x['l'] for x in d); hi = max(x['h'] for x in d)
-    step = (hi - lo) / bins or 1.0
-    B, S = [0.0] * bins, [0.0] * bins
-    for x in d:
-        i0 = min(int((x['l'] - lo) / step), bins - 1); i1 = min(int((x['h'] - lo) / step), bins - 1)
-        n = i1 - i0 + 1; b = x['b'] / n; s = (x['v'] - x['b']) / n
-        for i in range(i0, i1 + 1): B[i] += b; S[i] += s
-    tot = [B[i] + S[i] for i in range(bins)]
-    poc = max(range(bins), key=lambda i: tot[i]); total = sum(tot); acc = tot[poc]; l = h = poc
-    while acc < 0.7 * total and (l > 0 or h < bins - 1):
-        up = tot[h+1] if h < bins - 1 else -1; dn = tot[l-1] if l > 0 else -1
-        if up >= dn: h += 1; acc += up
-        else: l -= 1; acc += dn
-    return dict(step=step, poc=lo + step * (poc + .5), vah=lo + step * (h + 1), val=lo + step * l,
-                bins=[dict(p=lo + step * (i + .5), b=B[i], s=S[i]) for i in range(bins)])
 
-def analyze(d, exact=False, source="", novol=False):
-    if len(d) < 60: return {"error": "Not enough candles"}
-    last = d[-1]['c']; H, L = swings(d)
-    if len(H) < 2 or len(L) < 2: return {"error": "Not enough swings"}
-    sh, sl_ = d[H[-1]]['h'], d[L[-1]]['l']
-    up = d[H[-1]]['h'] > d[H[-2]]['h'] and d[L[-1]]['l'] > d[L[-2]]['l']
-    dn = d[H[-1]]['h'] < d[H[-2]]['h'] and d[L[-1]]['l'] < d[L[-2]]['l']
-    bias = "bull" if up else "bear" if dn else "range"; brk = None
-    if last > sh: brk = "Bullish BOS" if bias == "bull" else "Bullish CHoCH"; bias = "bull"
-    elif last < sl_: brk = "Bearish BOS" if bias == "bear" else "Bearish CHoCH"; bias = "bear"
-    tol = last * 0.001
-    ob_b = ob_bull(d); ob_s = ob_bull(mirror(d))
-    fb = bull_fvgs(d); fs = bull_fvgs(mirror(d))
-    obs = {}
-    if ob_b: obs['buy'] = dict(top=ob_b['top'], bot=ob_b['bot'], t=ob_b['t'])
-    if ob_s: obs['sell'] = dict(top=-ob_s['bot'], bot=-ob_s['top'], t=ob_s['t'])
-    top_vol = sorted(d[-200:], key=lambda x: -x['v'])[:10]
-    w = d[-100:]; wb = sum(x['b'] for x in w); wv = sum(x['v'] for x in w)
-    return dict(
-        candles=d, bias=bias, brk=brk, last=last, source=source, exact=exact, novol=novol,
-        sh=[dict(t=d[i]['t'], p=d[i]['h']) for i in H[-10:]], sl=[dict(t=d[i]['t'], p=d[i]['l']) for i in L[-10:]],
-        last_sh=sh, last_sl=sl_,
-        eqh=eq_levels([d[i]['h'] for i in H[-10:]], tol), eql=eq_levels([d[i]['l'] for i in L[-10:]], tol),
-        obs=obs,
-        fvgs=[dict(top=f[0], bot=f[1], t=f[2], type="bull") for f in fb] + [dict(top=-f[1], bot=-f[0], t=f[2], type="bear") for f in fs],
-        buy=side_plan(d, 1, bias == "bull"), sell=side_plan(d, -1, bias == "bear"),
-        vp=vprofile(d),
-        flow=dict(buy=wb, sell=wv - wb, n=len(w),
-                  bubbles=[dict(t=x['t'], p=(x['h'] + x['l']) / 2, v=x['v'], b=x['b']) for x in top_vol]))
+def vol_profile(t, h, l, v, bins=48):
+    hi, lo = max(h), min(l)
+    if hi <= lo:
+        return None
+    step = (hi - lo) / bins
+    use_vol = sum(v) > 0
+    acc = [0.0] * bins
+    for i in range(len(h)):
+        a = max(0, int((l[i] - lo) / step))
+        b = min(bins - 1, int((h[i] - lo) / step))
+        w = (v[i] if use_vol else 1.0) / (b - a + 1)
+        for k in range(a, b + 1):
+            acc[k] += w
+    poc = max(range(bins), key=lambda k: acc[k])
+    tot, cur = sum(acc), acc[poc]
+    a = b = poc
+    while cur < 0.7 * tot and (a > 0 or b < bins - 1):
+        up = acc[b + 1] if b < bins - 1 else -1
+        dn = acc[a - 1] if a > 0 else -1
+        if up >= dn:
+            b += 1
+            cur += acc[b]
+        else:
+            a -= 1
+            cur += acc[a]
+    return {
+        "mode": "volume" if use_vol else "time (no volume on this feed)",
+        "bins": [{"lo": lo + k * step, "hi": lo + (k + 1) * step, "v": acc[k]} for k in range(bins)],
+        "poc": lo + (poc + 0.5) * step, "vah": lo + (b + 1) * step, "val": lo + a * step,
+    }
 
-HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SMC Lab ⚡</title>
+
+def analyze(sym, tf, mode, cs):
+    sec = TF[tf]["sec"]
+    lim = 400 if mode == "scalp" else 500
+    s0 = max(0, len(cs["t"]) - lim)
+    T, O, H, L, C, V = (cs[k][s0:] for k in ("t", "o", "h", "l", "c", "v"))
+    last = len(T) - 1
+    forming = time.time() < T[-1] + sec
+    ncl = last if forming else last + 1
+    if ncl < 40:
+        raise RuntimeError("not enough closed candles")
+    o, h, l, c = O[:ncl], H[:ncl], L[:ncl], C[:ncl]
+    at = atr_series(h, l, c)
+    atr_now = at[-1]
+    n = 3 if mode == "scalp" else 7
+
+    swings, breaks, obs, trend = structure(o, h, l, c, at, n)
+    fvgs = find_fvgs(h, l, c, at, 0.3 if mode == "scalp" else 0.5)
+    price, hi_live, lo_live = C[last], H[last], L[last]
+
+    live_obs = [z for z in obs if not z["mit"]]
+    ob_out = []
+    for d in (1, -1):
+        ob_out += sorted([z for z in live_obs if z["dir"] == d], key=lambda z: -z["brk"])[:3]
+    fvg_out = []
+    for d in (1, -1):
+        fvg_out += sorted([z for z in fvgs if z["dir"] == d and not z["filled"]], key=lambda z: -z["k"])[:3]
+
+    sr = sr_levels(swings, ncl, price, 0.5 * atr_now)
+    fib = fib_leg(swings)
+    plen = 120 if mode == "scalp" else 200
+    prof = vol_profile(T[:ncl][-plen:], h[-plen:], l[-plen:], V[:ncl][-plen:])
+
+    # ---- signals (limit-entry at order block, needs confluence) ----
+    sigs = []
+    for d in (1, -1):
+        zs = [z for z in live_obs if z["dir"] == d and ((z["bottom"] < price) if d == 1 else (z["top"] > price))]
+        if not zs:
+            continue
+        dist = lambda z: max(0, price - z["top"]) if d == 1 else max(0, z["bottom"] - price)  # noqa
+        z = min(zs, key=dist)
+        ready = (lo_live <= z["top"] and price >= z["bottom"]) if d == 1 else (hi_live >= z["bottom"] and price <= z["top"])
+        if not ready and dist(z) > 1.5 * atr_now:
+            continue
+        entry = (z["top"] + z["bottom"]) / 2
+        sl = z["bottom"] - 0.25 * atr_now if d == 1 else z["top"] + 0.25 * atr_now
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+        tg = sorted([p for _, kd, p in swings if (kd == "H" if d == 1 else kd == "L") and ((p > entry + risk) if d == 1 else (p < entry - risk))],
+                    reverse=(d == -1))
+        tp1 = tg[0] if tg else entry + d * 2 * risk
+        tp2 = tg[1] if len(tg) > 1 else entry + d * 3 * risk
+        rr = abs(tp1 - entry) / risk
+        why = []
+        if trend == d:
+            why.append("trend aligned")
+        if any(f["dir"] == d and f["bottom"] < z["top"] and f["top"] > z["bottom"] for f in fvg_out):
+            why.append("FVG overlap")
+        if fib and ((entry <= fib["eq"]) if d == 1 else (entry >= fib["eq"])):
+            why.append("discount" if d == 1 else "premium")
+        if any(abs(x["price"] - (z["bottom"] if d == 1 else z["top"])) <= 0.5 * atr_now for x in sr):
+            why.append("S/R at zone")
+        valid = rr >= 1.5 and len(why) >= 2
+        sigs.append({
+            "id": "%s:%s:%s:%d:%d" % (sym, tf, mode, d, T[z["k"]]),
+            "dir": d, "status": ("ready" if ready else "watch") if valid else "weak",
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": round(rr, 2),
+            "score": len(why), "why": why, "zone_t": T[z["k"]], "top": z["top"], "bottom": z["bottom"],
+        })
+    sigs.sort(key=lambda s: ({"ready": 0, "watch": 1, "weak": 2}[s["status"]], -s["score"]))
+
+    # candle delta: ESTIMATE from close location inside the range (not tick data)
+    delta = []
+    for i in range(len(T)):
+        rng = H[i] - L[i]
+        delta.append(round(V[i] * (2 * (C[i] - L[i]) / rng - 1), 4) if rng > 0 and V[i] > 0 else 0)
+
+    ts = lambda i: T[i]  # noqa
+    return {
+        "candles": {"t": T, "o": O, "h": H, "l": L, "c": C, "v": V, "d": delta},
+        "forming": forming, "price": price, "atr": atr_now,
+        "trend": trend,
+        "obs": [{"dir": z["dir"], "t": ts(z["k"]), "top": z["top"], "bottom": z["bottom"]} for z in ob_out],
+        "fvgs": [{"dir": z["dir"], "t": ts(z["k"]), "top": z["top"], "bottom": z["bottom"]} for z in fvg_out],
+        "sr": [{"price": x["price"], "touches": x["touches"], "t": ts(x["first"])} for x in sr],
+        "breaks": [{"t": ts(b["i"]), "t0": ts(b["from"]), "dir": b["dir"], "kind": b["kind"], "level": b["level"]} for b in breaks[-8:]],
+        "fib": None if not fib else {"t0": ts(fib["i0"]), "up": fib["up"], "hi": fib["hi"], "lo": fib["lo"], "eq": fib["eq"], "levels": fib["levels"]},
+        "profile": prof, "signals": sigs,
+    }
+
+
+# ------------------------------------------------------------------- API
+@app.route("/api/analysis")
+def api_analysis():
+    sym = request.args.get("symbol", "BTCUSDT")
+    tf = request.args.get("tf", "15m")
+    mode = request.args.get("mode", "scalp")
+    if sym not in SYMBOLS or tf not in TF or mode not in ("scalp", "swing"):
+        return jsonify({"error": "bad parameters"}), 400
+    try:
+        cs, source, errors = get_candles(sym, tf)
+        out = analyze(sym, tf, mode, cs)
+        out.update({"source": source, "errors": errors, "server_time": int(time.time()),
+                    "has_volume": sum(cs["v"][-50:]) > 0, "symbol": sym, "tf": tf, "mode": mode})
+        return jsonify(out)
+    except Exception as e:  # noqa
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/depth")
+def api_depth():
+    sym = request.args.get("symbol", "BTCUSDT")
+    if sym not in SYMBOLS or SYMBOLS[sym]["src"] != "crypto":
+        return jsonify({"error": "no order book for this symbol on free data"}), 404
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/orderbook",
+                         params={"category": "linear", "symbol": sym, "limit": 50}, headers=UA, timeout=6)
+        j = r.json()["result"]
+
+        def side(rows, rev):
+            rows = [(float(p), float(q)) for p, q in rows][:14]
+            cum, out = 0.0, []
+            for p, q in rows:
+                cum += q
+                out.append({"p": p, "q": q, "cum": cum})
+            return out
+
+        return jsonify({"bids": side(j["b"], False), "asks": side(j["a"], True), "ts": int(time.time())})
+    except Exception as e:  # noqa
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/health")
+def health():
+    return jsonify({"ok": True})
+
+
+# ------------------------------------------------------ Telegram scanner
+SENT = set()
+
+
+def scanner():
+    tok, chat = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not tok or not chat:
+        return
+    items = [x.split(":") for x in os.environ.get("SCAN", "BTCUSDT:15m,XAUUSD:15m").split(",") if ":" in x]
+    while True:
+        for sym, tf in items:
+            try:
+                cs, _, _ = get_candles(sym, tf)
+                a = analyze(sym, tf, "scalp", cs)
+                for s in a["signals"]:
+                    if s["status"] == "ready" and s["id"] not in SENT:
+                        SENT.add(s["id"])
+                        txt = "%s %s %s setup\nEntry %.2f | SL %.2f | TP1 %.2f | TP2 %.2f\nRR %.2f | %s" % (
+                            sym, tf, "LONG" if s["dir"] == 1 else "SHORT", s["entry"], s["sl"], s["tp1"], s["tp2"],
+                            s["rr"], ", ".join(s["why"]))
+                        requests.post("https://api.telegram.org/bot%s/sendMessage" % tok,
+                                      json={"chat_id": chat, "text": txt}, timeout=8)
+            except Exception:  # noqa
+                pass
+        time.sleep(60)
+
+
+threading.Thread(target=scanner, daemon=True).start()
+
+# ------------------------------------------------------------- front-end
+PAGE = r'''<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VK Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
+:root{--ink:#0c1015;--panel:#121820;--line:#1f2833;--text:#d5dbe4;--mute:#7f8b9b;--up:#26b59a;--down:#e0584f;--gold:#e2a93b;--ice:#6aa8ff}
 *{box-sizing:border-box}
-body{margin:0;color:#e8eaf2;font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#2a1457 0,transparent 60%),radial-gradient(900px 500px at 100% 0,#06324a 0,transparent 55%),#080a10;min-height:100vh}
-main{max-width:1500px;margin:auto;padding:10px}
-header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px}
-.logo{font-size:22px;font-weight:800;letter-spacing:-.5px}.logo b{background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent}
-.pills{display:flex;gap:6px;overflow-x:auto;max-width:100%;padding:2px}
-.pill{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#cbd2e4;border-radius:999px;padding:7px 13px;cursor:pointer;font-size:13px;white-space:nowrap;transition:.15s}
-.pill:hover{transform:translateY(-1px);border-color:#7c3aed}
-.pill.on{background:linear-gradient(135deg,#7c3aed,#06b6d4);color:#fff;border-color:transparent;box-shadow:0 4px 18px rgba(124,58,237,.4)}
-.warn{font-size:12px;color:#fcd34d;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.35);border-radius:10px;padding:6px 10px;margin-bottom:8px}
-.chips{display:flex;gap:7px;overflow-x:auto;padding:2px 2px 8px}
-.chip{border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);border-radius:12px;padding:7px 12px;cursor:pointer;white-space:nowrap;font-size:13px;user-select:none;transition:.15s}
-.chip.on{background:rgba(34,211,238,.15);border-color:#22d3ee;color:#fff;box-shadow:0 0 14px rgba(34,211,238,.35)}
-#wrap{position:relative;height:calc(100vh - 175px);min-height:480px;border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,.09);background:rgba(10,12,20,.75);backdrop-filter:blur(8px)}
-#c,#ov{position:absolute;inset:0}#ov{pointer-events:none;z-index:2}
-#badge{position:absolute;left:12px;top:10px;z-index:4;font-size:13px;display:flex;gap:8px;align-items:center;pointer-events:none}
-#badge .px{font-size:20px;font-weight:700}
-.tag{padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700}
-.bull{background:rgba(52,211,153,.2);color:#34d399}.bear{background:rgba(248,113,113,.2);color:#f87171}.rng{background:rgba(251,191,36,.2);color:#fbbf24}
-#tip{position:absolute;z-index:5;display:none;background:rgba(15,18,30,.95);border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:8px 10px;font-size:12px;pointer-events:none;min-width:170px}
-#load{position:absolute;inset:0;z-index:6;display:flex;align-items:center;justify-content:center;background:rgba(8,10,16,.8);font-size:15px;text-align:center;padding:20px}
-#fs{position:absolute;right:70px;top:8px;z-index:4;border:0;background:rgba(255,255,255,.1);color:#fff;border-radius:8px;padding:5px 9px;cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px;margin-top:10px}
-.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:12px;backdrop-filter:blur(8px)}
-.card.sel{border-color:#22d3ee;box-shadow:0 0 18px rgba(34,211,238,.25)}
-.card h3{margin:0 0 6px;font-size:15px}
-.card table{width:100%;border-collapse:collapse}.card td{padding:3px 0;border-bottom:1px solid rgba(255,255,255,.06)}.card td:last-child{text-align:right;font-weight:600}
-.g{color:#34d399}.r{color:#f87171}.a{color:#fbbf24}.m{color:#8b93a7}.cy{color:#22d3ee}
-.in{display:flex;gap:8px;margin-bottom:6px}.in div{flex:1}.in label{font-size:11px;color:#8b93a7;display:block}
-input{width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#fff;border-radius:8px;padding:7px;font-size:15px}
-small{color:#8b93a7}
-.spin{width:22px;height:22px;border:3px solid rgba(255,255,255,.2);border-top-color:#22d3ee;border-radius:50%;animation:s 1s linear infinite;margin:0 auto 8px}@keyframes s{to{transform:rotate(360deg)}}
-</style></head><body><main>
-<header><div class="logo">SMC<b>Lab</b> ⚡</div><div class="pills" id="syms"></div><div class="pills" id="tfs"></div></header>
-<div class="warn">⚠ Educational tool, not financial advice. Rule-based reading; no setup is guaranteed and losses happen. Trade at your own risk.</div>
-<div class="chips" id="chips"></div>
-<div id="wrap"><div id="c"></div><canvas id="ov"></canvas>
-<div id="badge"></div><button id="fs" title="Fullscreen">⛶</button><div id="tip"></div>
-<div id="load"><div><div class="spin"></div><span id="lt">Loading live data...</span></div></div></div>
-<div class="grid" id="cards"></div>
-<div class="m" style="text-align:center;margin:14px 0 24px;font-size:12px" id="st"></div>
-</main>
+html,body{height:100%;margin:0;background:var(--ink);color:var(--text);font:13px/1.45 "IBM Plex Sans",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+button,select{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer}
+button:hover,select:hover{border-color:#32404f}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--ice);outline-offset:1px}
+button.on{background:#1b2531;border-color:var(--gold);color:var(--gold)}
+.app{display:grid;grid-template-rows:auto 1fr;height:100%}
+.top{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+.brand{font-weight:600;font-size:18px;color:var(--gold);letter-spacing:.5px;margin-right:6px}
+.grp{display:flex;gap:4px;align-items:center}
+.sep{width:1px;height:20px;background:var(--line);margin:0 4px}
+.status{margin-left:auto;color:var(--mute);font-size:12px;text-align:right}
+.status b{color:var(--text);font-weight:500}
+.main{display:grid;grid-template-columns:1fr 310px;min-height:0}
+.chartwrap{position:relative;min-height:0}
+#chart{position:absolute;inset:0}
+#ov{position:absolute;inset:0;pointer-events:none}
+.side{border-left:1px solid var(--line);overflow:auto;padding:12px;display:flex;flex-direction:column;gap:12px;background:var(--panel)}
+.card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#0f141b}
+.card h3{margin:0 0 6px;font-size:12px;font-weight:500;color:var(--mute)}
+.big{font-size:20px;font-weight:600}
+.long{color:var(--up)}.short{color:var(--down)}.wait{color:var(--mute)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px}
+.kv span:nth-child(odd){color:var(--mute)}.kv span:nth-child(even){text-align:right}
+.why{color:var(--mute);font-size:12px;margin-top:6px}
+.ladder{display:grid;gap:1px;font-size:12px}
+.row{position:relative;display:flex;justify-content:space-between;padding:1px 6px}
+.row i{position:absolute;inset:0 auto 0 0;opacity:.22}
+.row span{position:relative}
+.ask i{background:var(--down)}.bid i{background:var(--up)}
+.log{max-height:150px;overflow:auto;font-size:12px;color:var(--mute)}
+.log div{padding:2px 0;border-bottom:1px solid var(--line)}
+.note{font-size:11px;color:var(--mute)}
+.err{color:var(--down);font-size:12px;word-break:break-word}
+#toast{position:fixed;right:16px;top:64px;background:#1b2531;border:1px solid var(--gold);border-radius:8px;padding:10px 14px;display:none;z-index:9;max-width:300px}
+@media(max-width:860px){.main{grid-template-columns:1fr;grid-template-rows:62vh auto}.side{border-left:0;border-top:1px solid var(--line)}.status{margin-left:0;text-align:left}}
+</style></head>
+<body>
+<div class="app">
+ <div class="top">
+  <span class="brand">VK</span>
+  <select id="sym" aria-label="Symbol"></select>
+  <div class="grp" id="tfs"></div>
+  <div class="sep"></div>
+  <div class="grp" id="modes"><button data-m="scalp">Scalp</button><button data-m="swing">Swing</button></div>
+  <div class="sep"></div>
+  <div class="grp" id="tg"></div>
+  <button id="alertbtn">Alerts off</button>
+  <div class="status" id="status">connecting…</div>
+ </div>
+ <div class="main">
+  <div class="chartwrap"><div id="chart"></div><canvas id="ov"></canvas></div>
+  <div class="side">
+   <div class="card" id="sigcard"><h3>Trade setup</h3><div class="big wait">Scanning…</div></div>
+   <div class="card"><h3>Market</h3><div class="kv" id="mkt"></div></div>
+   <div class="card"><h3>Order book (Bybit)</h3><div class="ladder" id="depth"><span class="note">loading…</span></div></div>
+   <div class="card"><h3>Alert log</h3><div class="log" id="log"><span class="note">No setups yet.</span></div></div>
+   <div class="note" id="notes"></div>
+  </div>
+ </div>
+</div>
+<div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
-const SYMS=[['BTCUSDT','₿ BTC'],['ETHUSDT','Ξ ETH'],['XAUUSD','🥇 XAU/USD'],['GC','🥇 Gold Fut (vol)'],['PAXGUSDT','🪙 PAXG']];
+const SYMS=__SYMS__;
 const TFS=['1m','5m','15m','1h','4h','1d'];
-const CH=[['zones','🟢🔴 Buy/Sell Zones'],['plan','🎯 Trade Plan'],['struct','🧱 Structure'],['liq','💧 Liquidity'],['ob','🟪 Order Blocks'],['fvg','⬜ FVG'],['vol','📊 Volume'],['vp','🧬 Best Volume (Profile)'],['flow','⚡ Orders Executed']];
-let sym='BTCUSDT',tf='15m',A=null,fit=true,sel='auto',lines=[],ws=null,CM={},busy=false;
-const L={zones:1,plan:1,struct:0,liq:0,ob:0,fvg:0,vol:1,vp:0,flow:0};
-const f=n=>n==null?'-':(+n).toLocaleString(undefined,{maximumFractionDigits:Math.abs(n)>=1000?2:4});
-const fv=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(1)+'K':v.toFixed(v<10?2:0);
-function pills(){
- $('syms').innerHTML='';SYMS.forEach(([k,n])=>{const b=document.createElement('div');b.className='pill'+(k===sym?' on':'');b.textContent=n;b.onclick=()=>{sym=k;reset()};$('syms').appendChild(b)});
- $('tfs').innerHTML='';TFS.forEach(k=>{const b=document.createElement('div');b.className='pill'+(k===tf?' on':'');b.textContent=k;b.onclick=()=>{tf=k;reset()};$('tfs').appendChild(b)});
- $('chips').innerHTML='';CH.forEach(([k,n])=>{const b=document.createElement('div');b.className='chip'+(L[k]?' on':'');b.textContent=n;b.onclick=()=>{L[k]=L[k]?0:1;pills();applyLayers();cards()};$('chips').appendChild(b)});
-}
-const chart=LightweightCharts.createChart($('c'),{autoSize:true,layout:{background:{color:'rgba(0,0,0,0)'},textColor:'#8b93a7'},grid:{vertLines:{color:'rgba(255,255,255,.04)'},horzLines:{color:'rgba(255,255,255,.04)'}},timeScale:{timeVisible:true,rightOffset:8,borderColor:'rgba(255,255,255,.08)'},rightPriceScale:{borderColor:'rgba(255,255,255,.08)',scaleMargins:{top:.08,bottom:.2}},crosshair:{mode:0}});
-const ser=chart.addCandlestickSeries({upColor:'#22c55e',downColor:'#ef4444',wickUpColor:'#22c55e',wickDownColor:'#ef4444',borderVisible:false});
-const vs=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'vol'});
-chart.priceScale('vol').applyOptions({scaleMargins:{top:.86,bottom:0}});
-function pl(p,color,title,st,w){lines.push(ser.createPriceLine({price:p,color,lineWidth:w||1,lineStyle:st??2,axisLabelVisible:true,title}))}
-function curPlan(){if(!A)return null;if(sel==='buy')return A.buy;if(sel==='sell')return A.sell;return A.bias==='bull'?A.buy:A.bias==='bear'?A.sell:null}
-function draw(){
- ser.setData(A.candles.map(x=>({time:x.t,open:x.o,high:x.h,low:x.l,close:x.c})));
- vs.setData(A.novol?[]:A.candles.map(x=>({time:x.t,value:x.v,color:x.b>=x.v-x.b?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'})));
- if(fit){chart.timeScale().fitContent();fit=false}
- applyLayers();cards();badge();connectWS();
-}
-function applyLayers(){
- if(!A)return;
- lines.forEach(l=>ser.removePriceLine(l));lines=[];
- vs.applyOptions({visible:!!L.vol&&!A.novol});
- const mk=[];
- if(L.struct){A.sh.forEach(x=>mk.push({time:x.t,position:'aboveBar',color:'#f59e0b',shape:'circle',text:'SH'}));A.sl.forEach(x=>mk.push({time:x.t,position:'belowBar',color:'#38bdf8',shape:'circle',text:'SL'}));pl(A.last_sh,'#9ca3af','Swing High',3);pl(A.last_sl,'#9ca3af','Swing Low',3)}
- ser.setMarkers(mk.sort((a,b)=>a.time-b.time));
- if(L.liq){A.eqh.forEach(v=>pl(v,'#f59e0b','EQH 💧',2));A.eql.forEach(v=>pl(v,'#38bdf8','EQL 💧',2))}
- const p=curPlan();
- if(L.plan&&p){pl(p.entry,'#60a5fa','ENTRY',0,2);pl(p.sl,'#f87171','SL',0,2);pl(p.tp1,'#34d399','TP 1:1',2);pl(p.tp2,'#34d399','TP 1:2',0,2);pl(p.tp3,'#34d399','TP 1:3',2)}
- if(L.vp&&A.vp){pl(A.vp.poc,'#fde047','POC',0,2);pl(A.vp.vah,'#fde047','VAH',3);pl(A.vp.val,'#fde047','VAL',3)}
-}
-function badge(){const b=A.bias;$('badge').innerHTML=`<span>${SYMS.find(s=>s[0]===sym)[1]}</span><span class="px">${f(A.last)}</span><span class="tag ${b==='bull'?'bull':b==='bear'?'bear':'rng'}">${b==='bull'?'BULLISH':b==='bear'?'BEARISH':'RANGE'}</span>${A.brk?`<span class="tag rng">${A.brk}</span>`:''}`}
-// ---------- overlay: zones, FVG, OB, volume profile, order flow ----------
-const ov=$('ov'),cx=ov.getContext('2d');
-function frame(){try{drawOv()}catch(e){}requestAnimationFrame(frame)}
-function drawOv(){
- const w=$('wrap'),d=devicePixelRatio||1,W=w.clientWidth,H=w.clientHeight;
- if(ov.width!==Math.round(W*d)||ov.height!==Math.round(H*d)){ov.width=Math.round(W*d);ov.height=Math.round(H*d)}
- cx.setTransform(d,0,0,d,0,0);cx.clearRect(0,0,W,H);if(!A)return;
- let R=W-62;try{R=W-chart.priceScale('right').width()}catch(e){}
- const ts=chart.timeScale(),X=t=>{const x=ts.timeToCoordinate(t);return x==null?0:x},Y=p=>ser.priceToCoordinate(p);
- const box=(top,bot,t,fill,stroke,label,dash,lab2)=>{const y1=Y(top),y2=Y(bot);if(y1==null||y2==null)return;const x1=Math.max(0,X(t)),yt=Math.min(y1,y2),h=Math.max(Math.abs(y2-y1),2);
-  cx.fillStyle=fill;cx.fillRect(x1,yt,R-x1,h);cx.strokeStyle=stroke;cx.lineWidth=1;cx.setLineDash(dash?[5,4]:[]);cx.strokeRect(x1,yt,R-x1,h);cx.setLineDash([]);
-  cx.fillStyle=stroke;cx.font='bold 12px system-ui';cx.fillText(label,x1+8,lab2?yt+h-6:yt+14)};
- if(L.fvg)A.fvgs.forEach(z=>box(z.top,z.bot,z.t,'rgba(148,163,184,.13)','#94a3b8','FVG '+(z.type==='bull'?'▲':'▼'),1));
- if(L.ob){if(A.obs.buy)box(A.obs.buy.top,A.obs.buy.bot,A.obs.buy.t,'rgba(167,139,250,.14)','#a78bfa','OB (bull)',1,1);if(A.obs.sell)box(A.obs.sell.top,A.obs.sell.bot,A.obs.sell.t,'rgba(167,139,250,.14)','#a78bfa','OB (bear)',1,1)}
- if(L.zones){[['buy','rgba(34,197,94,.20)','#22c55e','BUY ZONE ▲'],['sell','rgba(239,68,68,.20)','#ef4444','SELL ZONE ▼']].forEach(([k,fl,st,lb])=>{const p=A[k];if(p)box(p.ob.top,p.ob.bot,p.ob.t,fl,st,lb+(p.aligned?'  ★ with trend':'  (counter-trend)'))})}
- if(L.vp&&A.vp){const mx=Math.max(...A.vp.bins.map(b=>b.b+b.s))||1,mw=(R)*.22;
-  A.vp.bins.forEach(b=>{const y1=Y(b.p+A.vp.step/2),y2=Y(b.p-A.vp.step/2);if(y1==null||y2==null)return;const h=Math.max(Math.abs(y2-y1)-1,1),yt=Math.min(y1,y2),wb=mw*b.b/mx,ws_=mw*b.s/mx;
-   cx.fillStyle='rgba(239,68,68,.45)';cx.fillRect(R-ws_,yt,ws_,h);cx.fillStyle='rgba(34,197,94,.45)';cx.fillRect(R-ws_-wb,yt,wb,h);
-   if(Math.abs(b.p-A.vp.poc)<1e-9){cx.strokeStyle='#fde047';cx.lineWidth=1.5;cx.strokeRect(R-ws_-wb,yt,wb+ws_,h);cx.fillStyle='#fde047';cx.font='bold 12px system-ui';cx.fillText('POC = best volume',R-mw-120,yt+h/2+4)}})}
- if(L.flow&&!A.novol){const mx=Math.max(...A.flow.bubbles.map(b=>b.v))||1;
-  A.flow.bubbles.forEach(b=>{const x=X(b.t),y=Y(b.p);if(y==null||x<0||x>R)return;const r=7+20*Math.sqrt(b.v/mx),bp=b.b/b.v,col=bp>=.5?'34,197,94':'239,68,68';
-   cx.beginPath();cx.arc(x,y,r,0,7);cx.fillStyle=`rgba(${col},.30)`;cx.fill();cx.strokeStyle=`rgb(${col})`;cx.lineWidth=1.5;cx.stroke();
-   cx.fillStyle='#fff';cx.font='bold 11px system-ui';cx.textAlign='center';cx.fillText(fv(b.v),x,y-1);cx.font='10px system-ui';cx.fillText((bp>=.5?'B ':'S ')+Math.round((bp>=.5?bp:1-bp)*100)+'%',x,y+11);cx.textAlign='left'})}
-}
-chart.subscribeCrosshairMove(p=>{const t=$('tip');if(!A||!p.time||!p.point||!(L.vol||L.flow||L.vp)){t.style.display='none';return}
- const c=CM[p.time];if(!c){t.style.display='none';return}const s=c.v-c.b,e=A.exact?'':' ~est';
- t.innerHTML=`<b>${new Date(c.t*1000).toLocaleString()}</b><br>O ${f(c.o)} H ${f(c.h)}<br>L ${f(c.l)} C ${f(c.c)}`+(A.novol?'':`<br>Volume <b>${fv(c.v)}</b><br><span class="g">Buy ${fv(c.b)}</span> · <span class="r">Sell ${fv(s)}</span>${e}<br>Delta <b class="${c.b>=s?'g':'r'}">${fv(c.b-s)}</b>`);
- t.style.display='block';const w=$('wrap').clientWidth;t.style.left=Math.min(p.point.x+14,w-190)+'px';t.style.top=Math.max(p.point.y-60,40)+'px'});
-// ---------- panels ----------
-function planCard(p,name,key){
- const bal=+$('bal')?.value||100,rp=+$('rp')?.value||10;
- if(!p)return `<div class="card"><h3>${name}</h3><p class="m">No valid ${name.toLowerCase()} zone right now (price is not at / has broken that zone). Waiting is a valid decision.</p></div>`;
- const risk=bal*rp/100,dist=Math.abs(p.entry-p.sl),u=risk/dist,val=u*p.entry;
- const gr=p.score>=4?['A strong','g']:p.score==3?['B average','a']:['C weak','r'],cur=curPlan()===p;
- return `<div class="card ${cur?'sel':''}" onclick="sel='${key}';applyLayers();cards()" style="cursor:pointer"><h3>${p.side==='BUY'?'🟢':'🔴'} ${name} <span class="${gr[1]}">${gr[0]} (${p.score}/5)</span></h3>
- <small>${p.aligned?'★ with trend':'⚠ counter-trend (riskier)'} · tap to show on chart</small><table>
- <tr><td>Entry (limit)</td><td>${f(p.entry)}</td></tr><tr><td>Stop loss</td><td class="r">${f(p.sl)}</td></tr>
- <tr><td>TP 1:1 / 1:2 / 1:3</td><td class="g">${f(p.tp1)} / ${f(p.tp2)} / ${f(p.tp3)}</td></tr>
- <tr><td>Liquidity target</td><td>${p.liq?f(p.liq)+' ('+p.rr_liq.toFixed(1)+'R)':'none'}</td></tr>
- <tr><td>SL to breakeven at (1.1R)</td><td>${f(p.trail)}</td></tr>
- <tr><td>Risk $ / size (units)</td><td>$${f(risk)} / ${u.toFixed(5)}</td></tr><tr><td>Position value / leverage</td><td>$${f(val)} / ${(val/bal).toFixed(1)}x</td></tr></table>
- <small>${p.reasons.join(' · ')||'No extra confluence'}</small></div>`}
-function cards(){
- if(!A)return;const bal=$('bal')?.value||100,rp=$('rp')?.value||10;
- const vp=A.vp,fl=A.flow,tot=fl.buy+fl.sell,bp=tot?fl.buy/tot*100:50;
- const stat=A.novol?`<p class="a">Spot XAU/USD has no real volume. Profile shows time-at-price instead. Use "Gold Fut (vol)" or PAXG for volume.</p>`:
- `<table><tr><td>Best volume price (POC)</td><td class="a">${f(vp.poc)}</td></tr><tr><td>Value area (70%)</td><td>${f(vp.val)} – ${f(vp.vah)}</td></tr>
- <tr><td>Buy vs Sell (last ${fl.n} candles)</td><td><span class="g">${bp.toFixed(0)}%</span> / <span class="r">${(100-bp).toFixed(0)}%</span></td></tr>
- <tr><td>Net delta</td><td class="${fl.buy>=fl.sell?'g':'r'}">${fv(fl.buy-fl.sell)}</td></tr></table>
- <small>${A.exact?'Buy/sell split is exact exchange taker data.':'Buy/sell split is estimated from candle shape (this source gives no taker data).'}</small>`;
- const risk=`<div class="card"><h3>🧮 Your risk</h3><div class="in"><div><label>Balance $</label><input id="bal" type="number" value="${bal}"></div><div><label>Risk %</label><input id="rp" type="number" value="${rp}"></div></div>
- ${+rp>=5?`<p class="r">High risk: ${rp}% per trade. 5 losses in a row = about -${((1-Math.pow(1-rp/100,5))*100).toFixed(0)}% of the account.</p>`:'<p class="m">Common practice is 0.5-2% per trade.</p>'}
- <small>Structure: <b>${A.bias.toUpperCase()}</b> · ${A.brk||'no fresh break'}<br>Source: ${A.source}</small></div>`;
- const act=document.activeElement&&document.activeElement.id,pos=document.activeElement&&document.activeElement.selectionStart;
- $('cards').innerHTML=planCard(A.buy,'Buy plan','buy')+planCard(A.sell,'Sell plan','sell')+`<div class="card"><h3>🧬 Volume &amp; orders</h3>${stat}</div>`+risk;
- ['bal','rp'].forEach(i=>$(i).oninput=cards);
- if(act==='bal'||act==='rp'){const e=$(act);e.focus();try{e.setSelectionRange(pos,pos)}catch(x){}}
-}
-// ---------- live ticks (Binance websocket when source is Binance) ----------
-function connectWS(){
- if(ws){try{ws.close()}catch(e){}ws=null}
- if(!A||A.source!=='binance'||!['BTCUSDT','ETHUSDT','PAXGUSDT'].includes(sym))return;
- try{ws=new WebSocket(`wss://stream.binance.com:9443/ws/${sym.toLowerCase()}@kline_${tf}`);
-  ws.onmessage=e=>{const k=JSON.parse(e.data).k;if(!k)return;const t=Math.floor(k.t/1000),o=+k.o,h=+k.h,l=+k.l,c=+k.c,v=+k.v,b=+k.V;
-   ser.update({time:t,open:o,high:h,low:l,close:c});if(!A.novol)vs.update({time:t,value:v,color:b>=v-b?'rgba(34,197,94,.45)':'rgba(239,68,68,.45)'});
-   CM[t]={t,o,h,l,c,v,b};A.last=c;badge()}}catch(e){}
-}
-// ---------- loading ----------
-function showLoad(m){$('load').style.display='flex';$('lt').textContent=m}
-function reset(){A=null;CM={};fit=true;ser.setData([]);vs.setData([]);ser.setMarkers([]);lines.forEach(l=>ser.removePriceLine(l));lines=[];pills();showLoad('Loading live data...');load()}
-async function load(){
- if(busy)return;busy=true;const hint=setTimeout(()=>{if(!A)showLoad('Server is waking up (free plan can take ~50 sec)...')},4000);
- try{const r=await fetch(`/api/analyze?symbol=${sym}&interval=${tf}`);const a=await r.json();if(a.error)throw a.error;
-  A=a;CM={};a.candles.forEach(c=>CM[c.t]=c);draw();$('load').style.display='none';$('st').textContent='Live · updated '+new Date().toLocaleTimeString()+' · source: '+a.source}
- catch(e){if(!A)showLoad('⚠ '+e+' (retrying...)');else $('st').textContent='⚠ '+e}
- finally{clearTimeout(hint);busy=false}
-}
-$('fs').onclick=()=>{const w=$('wrap');document.fullscreenElement?document.exitFullscreen():w.requestFullscreen&&w.requestFullscreen()};
-pills();frame();load();setInterval(load,8000);
-</script></body></html>
-"""
+const TOG=[['ob','Order blocks'],['fvg','FVG'],['sr','S/R'],['fib','Fib'],['prof','Profile'],['str','Structure'],['dl','Delta']];
+let S={sym:'BTCUSDT',tf:'15m',mode:'scalp',on:{ob:1,fvg:1,sr:1,fib:0,prof:1,str:1,dl:1},alerts:0};
+try{Object.assign(S,JSON.parse(localStorage.getItem('vk')||'{}'));S.alerts=0}catch(e){}
+const save=()=>{try{localStorage.setItem('vk',JSON.stringify(S))}catch(e){}};
+const OFF=-new Date().getTimezoneOffset()*60;   // show candles in browser-local time
+let A=null,seen=new Set(),first=true,prec=2;
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def _send(self, code, body, ctype):
-        b = body.encode(); self.send_response(code)
-        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(b)))
-        self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(b)
-    def do_GET(self):
-        u = urllib.parse.urlparse(self.path)
-        if u.path == "/": return self._send(200, HTML, "text/html; charset=utf-8")
-        if u.path == "/health": return self._send(200, "ok", "text/plain")   # for uptime pingers
-        if u.path == "/api/analyze":
-            q = urllib.parse.parse_qs(u.query)
-            sym = q.get("symbol", ["BTCUSDT"])[0]; iv = q.get("interval", ["15m"])[0]
-            try:
-                if sym not in ROUTE or iv not in IVS: raise ValueError("Unsupported symbol/interval")
-                hit = CACHE.get((sym, iv))
-                if hit and time.time() - hit[0] < TTL: res = hit[1]
-                else:
-                    d, exact, src, novol = fetch(sym, iv)
-                    res = analyze(d, exact, src, novol); CACHE[(sym, iv)] = (time.time(), res)
-            except Exception as e:
-                res = {"error": str(e)}
-            return self._send(200, json.dumps(res), "application/json")
-        self._send(404, "not found", "text/plain")
+// ---- controls
+for(const k in SYMS){const o=document.createElement('option');o.value=k;o.textContent=k+' · '+SYMS[k];$('sym').appendChild(o)}
+$('sym').value=S.sym;$('sym').onchange=e=>{S.sym=e.target.value;first=true;seen.clear();save();load()};
+TFS.forEach(t=>{const b=document.createElement('button');b.textContent=t;b.dataset.t=t;b.onclick=()=>{S.tf=t;first=true;seen.clear();save();paint();load()};$('tfs').appendChild(b)});
+$('modes').querySelectorAll('button').forEach(b=>b.onclick=()=>{S.mode=b.dataset.m;first=true;save();paint();load()});
+TOG.forEach(([k,n])=>{const b=document.createElement('button');b.textContent=n;b.dataset.k=k;b.onclick=()=>{S.on[k]=S.on[k]?0:1;save();paint();if(A)render()};$('tg').appendChild(b)});
+function paint(){
+ $('tfs').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.t===S.tf));
+ $('modes').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.m===S.mode));
+ $('tg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!S.on[b.dataset.k]));
+ $('alertbtn').textContent=S.alerts?'Alerts on':'Alerts off';$('alertbtn').classList.toggle('on',!!S.alerts);
+}
+$('alertbtn').onclick=async()=>{
+ S.alerts=S.alerts?0:1;
+ if(S.alerts){beep(0.0001);if('Notification' in window&&Notification.permission==='default'){try{await Notification.requestPermission()}catch(e){}}}
+ paint()};
+
+// ---- chart
+const chart=LightweightCharts.createChart($('chart'),{
+ layout:{background:{color:'#0c1015'},textColor:'#8a96a6',fontFamily:'IBM Plex Sans, system-ui, sans-serif'},
+ grid:{vertLines:{color:'#141b24'},horzLines:{color:'#141b24'}},
+ rightPriceScale:{borderColor:'#1f2833',scaleMargins:{top:.04,bottom:.34}},
+ timeScale:{borderColor:'#1f2833',timeVisible:true,secondsVisible:false,rightOffset:10},
+ crosshair:{mode:0},
+ watermark:{visible:true,text:'VK',color:'rgba(226,169,59,.28)',fontSize:46,horzAlign:'left',vertAlign:'bottom'},
+ autoSize:true});
+const cs=chart.addCandlestickSeries({upColor:'#26b59a',downColor:'#e0584f',borderVisible:false,wickUpColor:'#26b59a',wickDownColor:'#e0584f',priceLineColor:'#e2a93b'});
+const vs=chart.addHistogramSeries({priceScaleId:'vol',priceFormat:{type:'volume'},lastValueVisible:false,priceLineVisible:false});
+chart.priceScale('vol').applyOptions({scaleMargins:{top:.68,bottom:.16}});
+const ds=chart.addHistogramSeries({priceScaleId:'dl',lastValueVisible:false,priceLineVisible:false});
+chart.priceScale('dl').applyOptions({scaleMargins:{top:.86,bottom:0}});
+
+// ---- data
+async function load(){
+ try{
+  const r=await fetch(`/api/analysis?symbol=${encodeURIComponent(S.sym)}&tf=${S.tf}&mode=${S.mode}`);
+  const j=await r.json();
+  if(j.error){$('status').innerHTML='<span class="err">'+j.error+'</span>';return}
+  A=j;render();alertCheck();
+ }catch(e){$('status').innerHTML='<span class="err">server not reachable (free plan may be waking up)</span>'}
+}
+function render(){
+ const c=A.candles,n=c.t.length,P=A.price;
+ prec=P>=100?2:(P>=1?3:5);
+ cs.applyOptions({priceFormat:{type:'price',precision:prec,minMove:Math.pow(10,-prec)}});
+ const d1=[],vv=[],dd=[];
+ for(let i=0;i<n;i++){
+  const t=c.t[i]+OFF,up=c.c[i]>=c.o[i];
+  d1.push({time:t,open:c.o[i],high:c.h[i],low:c.l[i],close:c.c[i]});
+  if(A.has_volume){vv.push({time:t,value:c.v[i],color:up?'rgba(38,181,154,.45)':'rgba(224,88,79,.45)'});
+   if(S.on.dl)dd.push({time:t,value:c.d[i],color:c.d[i]>=0?'rgba(38,181,154,.85)':'rgba(224,88,79,.85)'})}
+ }
+ cs.setData(d1);vs.setData(vv);ds.setData(dd);
+ // markers: structure breaks on the exact break candle + active signal
+ const m=[];
+ if(S.on.str)A.breaks.forEach(b=>m.push({time:b.t+OFF,position:b.dir>0?'belowBar':'aboveBar',color:b.kind==='CHoCH'?'#e2a93b':(b.dir>0?'#26b59a':'#e0584f'),shape:b.dir>0?'arrowUp':'arrowDown',text:b.kind}));
+ const sg=A.signals.find(s=>s.status!=='weak');
+ if(sg&&sg.status==='ready')m.push({time:c.t[n-1]+OFF,position:sg.dir>0?'belowBar':'aboveBar',color:'#ffffff',shape:'circle',text:sg.dir>0?'LONG':'SHORT'});
+ m.sort((a,b)=>a.time-b.time);cs.setMarkers(m);
+ if(first){chart.timeScale().setVisibleLogicalRange({from:Math.max(0,n-110),to:n+12});first=false}
+ sidebar();
+}
+function f(x){return Number(x).toFixed(prec)}
+function sidebar(){
+ const sg=A.signals.find(s=>s.status!=='weak'),card=$('sigcard');
+ if(sg){
+  const cls=sg.dir>0?'long':'short',side=sg.dir>0?'LONG':'SHORT';
+  card.innerHTML=`<h3>Trade setup</h3><div class="big ${cls}">${side} · ${sg.status==='ready'?'price in zone':'approaching zone'}</div>
+  <div class="kv" style="margin-top:8px"><span>Entry</span><span>${f(sg.entry)}</span><span>Stop</span><span>${f(sg.sl)}</span><span>TP1</span><span>${f(sg.tp1)}</span><span>TP2</span><span>${f(sg.tp2)}</span><span>Reward : risk</span><span>${sg.rr}</span><span>Confluence</span><span>${sg.score}/4</span></div>
+  <div class="why">${sg.why.join(' · ')}</div>`;
+ }else card.innerHTML='<h3>Trade setup</h3><div class="big wait">No valid setup</div><div class="why">Scanning every few seconds. A setup needs an untouched order block, at least 2 confluences and reward:risk ≥ 1.5.</div>';
+ const tr=A.trend>0?'Bullish':A.trend<0?'Bearish':'Undefined';
+ const pr=A.profile;
+ $('mkt').innerHTML=`<span>Price</span><span>${f(A.price)}</span><span>Structure</span><span class="${A.trend>0?'long':A.trend<0?'short':''}">${tr}</span><span>ATR</span><span>${f(A.atr)}</span>`+(pr?`<span>POC</span><span>${f(pr.poc)}</span><span>Value area</span><span>${f(pr.val)} – ${f(pr.vah)}</span>`:'');
+ const now=new Date().toLocaleTimeString();
+ $('status').innerHTML=`<b>${A.source}</b> · ${A.forming?'candle forming, analysis on closed candles':'last candle closed'} · updated ${now}`;
+ $('notes').innerHTML=(A.has_volume?'Delta is estimated from where each candle closes inside its range. It is not tick-level delta. ':'This feed has no volume, so there is no delta and the profile is by time spent. ')+(A.errors.length?'<br><span class="err">Fallback used: '+A.errors.join(' | ')+'</span>':'');
+}
+
+// ---- overlay drawing
+const cv=$('ov'),ctx=cv.getContext('2d');
+function fit(){const r=$('chart').getBoundingClientRect(),d=window.devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d;cv.style.width=r.width+'px';cv.style.height=r.height+'px';ctx.setTransform(d,0,0,d,0,0)}
+new ResizeObserver(fit).observe($('chart'));fit();
+const X=t=>{const x=chart.timeScale().timeToCoordinate(t);return x===null?null:x};
+const Y=p=>cs.priceToCoordinate(p);
+function box(t0,top,bot,fill,stroke,label,dash){
+ const W=cv.clientWidth-chart.priceScale('right').width();
+ let x0=X(t0+OFF);if(x0===null)x0=0;x0=Math.max(0,x0);
+ const y0=Y(top),y1=Y(bot);if(y0===null||y1===null||x0>W)return;
+ ctx.fillStyle=fill;ctx.fillRect(x0,y0,W-x0,y1-y0);
+ ctx.strokeStyle=stroke;ctx.setLineDash(dash||[]);ctx.lineWidth=1;ctx.strokeRect(x0+.5,y0+.5,W-x0-1,y1-y0-1);ctx.setLineDash([]);
+ if(label){ctx.fillStyle=stroke;ctx.font='11px IBM Plex Sans, sans-serif';ctx.fillText(label,x0+6,Math.min(y0,y1)+12)}
+}
+function hline(t0,p,col,label,dash,w){
+ const W=cv.clientWidth-chart.priceScale('right').width();
+ let x0=t0===null?0:X(t0+OFF);if(x0===null)x0=0;x0=Math.max(0,x0);
+ const y=Y(p);if(y===null)return;
+ ctx.strokeStyle=col;ctx.lineWidth=w||1;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.moveTo(x0,y+.5);ctx.lineTo(W,y+.5);ctx.stroke();ctx.setLineDash([]);
+ if(label){ctx.fillStyle=col;ctx.font='11px IBM Plex Sans, sans-serif';ctx.textAlign='right';ctx.fillText(label,W-6,y-4);ctx.textAlign='left'}
+}
+function draw(){
+ ctx.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+ if(!A)return;
+ const W=cv.clientWidth-chart.priceScale('right').width();
+ if(S.on.prof&&A.profile){
+  const pr=A.profile,mx=Math.max(...pr.bins.map(b=>b.v));
+  pr.bins.forEach(b=>{const y0=Y(b.hi),y1=Y(b.lo);if(y0===null||y1===null)return;
+   const w=(b.v/mx)*W*.16,inVA=b.hi>pr.val&&b.lo<pr.vah;
+   ctx.fillStyle=inVA?'rgba(106,168,255,.30)':'rgba(127,139,155,.20)';ctx.fillRect(W-w,y0+.5,w,Math.max(1,y1-y0-1))});
+  hline(null,pr.poc,'#e2a93b','POC',[],1.5);
+ }
+ if(S.on.sr)A.sr.forEach(s=>hline(s.t,s.price,'rgba(127,139,155,.9)',f(s.price)+' ×'+s.touches,[2,4]));
+ if(S.on.fib&&A.fib){const F=A.fib;F.levels.forEach(l=>hline(F.t0,l.price,'rgba(226,169,59,.8)',l.r+'',[1,3]));hline(F.t0,F.eq,'rgba(226,169,59,.45)','EQ',[6,4])}
+ if(S.on.fvg)A.fvgs.forEach(z=>box(z.t,z.top,z.bottom,z.dir>0?'rgba(106,168,255,.12)':'rgba(176,124,255,.12)',z.dir>0?'#6aa8ff':'#b07cff','FVG',[3,3]));
+ if(S.on.ob)A.obs.forEach(z=>box(z.t,z.top,z.bottom,z.dir>0?'rgba(38,181,154,.16)':'rgba(224,88,79,.16)',z.dir>0?'#26b59a':'#e0584f',z.dir>0?'Bull OB':'Bear OB'));
+ if(S.on.str)A.breaks.forEach(b=>{const x0=X(b.t0+OFF),x1=X(b.t+OFF),y=Y(b.level);if(x0===null||x1===null||y===null)return;
+  ctx.strokeStyle=b.kind==='CHoCH'?'#e2a93b':'#7f8b9b';ctx.setLineDash([4,3]);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x0,y+.5);ctx.lineTo(x1,y+.5);ctx.stroke();ctx.setLineDash([])});
+ const sg=A.signals.find(s=>s.status!=='weak');
+ if(sg){
+  const t=A.candles.t[A.candles.t.length-1];
+  const yE=Y(sg.entry),yS=Y(sg.sl),yT=Y(sg.tp1);
+  let x0=X(t+OFF);if(x0===null)x0=W-60;
+  if(yE!==null&&yS!==null){ctx.fillStyle='rgba(224,88,79,.10)';ctx.fillRect(x0,Math.min(yE,yS),W-x0,Math.abs(yE-yS))}
+  if(yE!==null&&yT!==null){ctx.fillStyle='rgba(38,181,154,.10)';ctx.fillRect(x0,Math.min(yE,yT),W-x0,Math.abs(yE-yT))}
+  hline(t,sg.entry,'#ffffff','ENTRY '+f(sg.entry),[],1.5);hline(t,sg.sl,'#e0584f','SL '+f(sg.sl),[],1.5);
+  hline(t,sg.tp1,'#26b59a','TP1 '+f(sg.tp1),[],1.5);hline(t,sg.tp2,'#26b59a','TP2 '+f(sg.tp2),[4,3],1);
+ }
+ requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ---- alerts
+function beep(g){try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),v=a.createGain();o.frequency.value=880;v.gain.value=g||.15;o.connect(v);v.connect(a.destination);o.start();o.stop(a.currentTime+.25)}catch(e){}}
+function alertCheck(){
+ A.signals.filter(s=>s.status==='ready').forEach(s=>{
+  if(seen.has(s.id))return;seen.add(s.id);
+  const msg=`${S.sym} ${S.tf} ${s.dir>0?'LONG':'SHORT'} · entry ${f(s.entry)} · SL ${f(s.sl)} · TP1 ${f(s.tp1)} · RR ${s.rr}`;
+  const L=$('log');if(L.querySelector('.note'))L.innerHTML='';
+  const d=document.createElement('div');d.textContent=new Date().toLocaleTimeString()+'  '+msg;L.prepend(d);
+  if(S.alerts){beep();const T=$('toast');T.textContent=msg;T.style.display='block';setTimeout(()=>T.style.display='none',9000);
+   try{if(Notification.permission==='granted')new Notification('VK setup',{body:msg})}catch(e){}}
+ });
+}
+
+// ---- order book
+async function depth(){
+ const el=$('depth');
+ try{
+  const r=await fetch('/api/depth?symbol='+encodeURIComponent(S.sym));const j=await r.json();
+  if(j.error){el.innerHTML='<span class="note">Real order book is not available for this symbol on free data. Use BTC, ETH, SOL or XAUTUSDT.</span>';return}
+  const mx=Math.max(j.bids[j.bids.length-1].cum,j.asks[j.asks.length-1].cum);
+  const row=(x,c)=>`<div class="row ${c}"><i style="width:${(x.cum/mx*100).toFixed(0)}%"></i><span>${f(x.p)}</span><span>${x.q.toFixed(3)}</span></div>`;
+  el.innerHTML=j.asks.slice().reverse().map(x=>row(x,'ask')).join('')+j.bids.map(x=>row(x,'bid')).join('');
+ }catch(e){}
+}
+
+paint();depth();
+(function loop(){load().finally(()=>setTimeout(loop,(S.sym==='XAUUSD'||S.sym==='GC=F')?9000:4000))})();
+setInterval(depth,3000);
+</script></body></html>'''
+
+
+@app.route("/")
+def index():
+    import json
+    syms = json.dumps({k: v["name"] for k, v in SYMBOLS.items()})
+    return Response(PAGE.replace("__SYMS__", syms), mimetype="text/html")
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000")); online = "PORT" in os.environ
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer(("0.0.0.0" if online else "127.0.0.1", port), Handler) as srv:
-        print(f"Running on port {port}  (Ctrl+C to stop)")
-        if not online:
-            try: webbrowser.open(f"http://127.0.0.1:{port}")
-            except Exception: pass
-        srv.serve_forever()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
