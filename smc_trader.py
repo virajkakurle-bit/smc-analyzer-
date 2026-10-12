@@ -149,7 +149,7 @@ function p2(){const dl=x=>2*x.b-x.v;let c=0;
  else{l2.applyOptions({visible:false});l2.setData([]);s2.setData(C.map(x=>p2m==='Delta'?{time:x.t,value:dl(x),color:dl(x)>=0?'#22c55e':'#ef4444'}:{time:x.t,value:x.v,color:x.b>=x.v-x.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'}))}}
 // ---- overlay ----
 const ov=$('ov'),cx=ov.getContext('2d');
-function frame(){try{draw()}catch(e){}requestAnimationFrame(frame)}
+function frame(){try{flush();draw()}catch(e){}requestAnimationFrame(frame)}
 function draw(){const w=$('wrap'),d=devicePixelRatio||1,W=w.clientWidth,H=w.clientHeight;
  if(ov.width!==Math.round(W*d)||ov.height!==Math.round(H*d)){ov.width=Math.round(W*d);ov.height=Math.round(H*d)}
  cx.setTransform(d,0,0,d,0,0);cx.clearRect(0,0,W,H);if(!A||C.length<3)return;
@@ -200,18 +200,23 @@ async function backfill(tk){const[s,m]=SY[sy],h=HOST[m][0];let from=null,last=0;
   r.forEach(d=>{if(d.T>=C[C.length-1].t*1000)fpAdd(d);last=d.a});from=last+1;if(r.length<1000)break}catch(e){break}}return last}
 function startWS(tk,lastA){const[s,m]=SY[sy],q=s.toLowerCase();ws=new WebSocket(WSH[m]+`${q}@kline_${tf}/${q}@aggTrade`);
  ws.onmessage=e=>{if(tk!==tok)return;const j=JSON.parse(e.data),d=j.data;if(!d)return;
-  lastMsg=Date.now();if(d.e==='aggTrade'){if(d.a>lastA){lastA=d.a;fpAdd(d)}return}
+  lastMsg=Date.now();if(d.e==='aggTrade'){if(d.a>lastA){lastA=d.a;fpAdd(d);tick(d)}return}
   const k=d.k;onK({t:k.t/1000,o:+k.o+OFF,h:+k.h+OFF,l:+k.l+OFF,c:+k.c+OFF,v:+k.v,b:+k.V},k.x)};
  ws.onclose=()=>{if(tk===tok)setTimeout(()=>{if(tk===tok)startWS(tk,lastA)},3000)}}
-let lastMsg=0,poll=null;
+let lastMsg=0,poll=null,dirty=0,lastAl=0;
+function tick(d){const l=C[C.length-1];if(!l||Math.floor(d.T/1000/TF[tf])*TF[tf]!==l.t)return;const p=+d.p+OFF,q=+d.q;l.c=p;if(p>l.h)l.h=p;if(p<l.l)l.l=p;l.v+=q;if(!d.m)l.b+=q;dirty=1;lastUpd=Date.now()}
+function flush(){if(!dirty||!C.length)return;dirty=0;const c=C[C.length-1],dl=2*c.b-c.v;ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});
+ if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
+ $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
+ if(A){A.last=c.c;if(Date.now()-lastAl>500){lastAl=Date.now();alerts()}}}
 function onK(c,x){lastUpd=Date.now();const l=C[C.length-1];if(l.t===c.t)C[C.length-1]=c;else if(c.t>l.t){C.push(c);if(C.length>1500)C.shift()}else return;
  ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});const dl=2*c.b-c.v;if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
  $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
  if(x){recalc();p2()}else if(A){A.last=c.c;alerts()}}
-let lastUpd=0,dErr='';function setDot(live){const t=lastUpd?new Date(lastUpd).toLocaleTimeString():'-';$('dot').innerHTML=(live?'<span class="g">● LIVE</span>':'<span class="a">● POLLING (REST 2s)</span>')+` <span class="m">${t}</span>`+(dErr?` <span class="r">${dErr}</span>`:'')}
+let lastUpd=0,dErr='';function setDot(live){const t=lastUpd?new Date(lastUpd).toLocaleTimeString():'-';$('dot').innerHTML=(live?'<span class="g">● LIVE</span>':'<span class="a">● POLLING (REST 1s)</span>')+` <span class="m">${t}</span>`+(dErr?` <span class="r">${dErr}</span>`:'')}
 function startPoll(tk){clearInterval(poll);const[s,m]=SY[sy];poll=setInterval(async()=>{if(tk!==tok)return clearInterval(poll);const live=Date.now()-lastMsg<4000;setDot(live);if(live)return;
  try{const r=await(await fetch(`${HOST[m][0]}/klines?symbol=${s}&interval=${tf}&limit=2`)).json(),q=r.map(x=>({t:x[0]/1000,o:+x[1]+OFF,h:+x[2]+OFF,l:+x[3]+OFF,c:+x[4]+OFF,v:+x[5],b:+x[9]}));
-  dErr='';onK(q[0],false);const n0=C.length;onK(q[1],false);if(C.length>n0){recalc();p2()}}catch(e){dErr='REST error: '+e}setDot(false)},2000)}
+  dErr='';onK(q[0],false);const n0=C.length;onK(q[1],false);if(C.length>n0){recalc();p2()}}catch(e){dErr='REST error: '+e}setDot(false)},1000)}
 function recalc(){const D=C.slice(0,-1),a=analyzeAll(D,tf);if(a){A=a;lay();side();alerts()}}   // analysis only on CLOSED candles: nothing shifts mid-candle
 function loadOff(){try{OFF=+localStorage.getItem('off_'+sy)||0}catch(e){OFF=0}}
 function setOff(v){OFF=+v.toFixed(2);try{localStorage.setItem('off_'+sy,OFF)}catch(e){}reset()}
