@@ -1,8 +1,33 @@
 #!/usr/bin/env python3
-"""VK Terminal server. Serves the dashboard; all market data is fetched by your browser directly from Binance.
-Run locally: python smc_trader.py  -> http://127.0.0.1:8000   (or just open vk-terminal.html)
+"""VK Terminal server. Serves the dashboard; market data comes straight from Binance in your browser.
+Optional AI: set env var ANTHROPIC_API_KEY (and optionally AI_MODEL) to enable the "Ask VK AI" box.
+Run locally: python smc_trader.py  -> http://127.0.0.1:8000
 Educational tool, not financial advice."""
-import os, http.server, socketserver, webbrowser
+import os, json, time, http.server, socketserver, webbrowser, urllib.request, urllib.error
+
+KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
+HITS = {}      # ip -> [timestamps], simple abuse limit so a public site cannot drain your API credits
+LIMIT = int(os.environ.get("AI_LIMIT_PER_HOUR", "30"))
+
+SYSTEM = '''You explain a rule-based Smart Money Concepts reading shown inside an educational trading terminal.
+Use ONLY the JSON snapshot you are given. Never invent prices, levels or data.
+Answer in the same language/style as the user's question (Hinglish, Hindi or English). Keep it under 150 words, plain text, no tables.
+Explain why the zone exists (trend, liquidity sweep, order block, delta, volume profile), what would invalidate it (a close beyond the stop loss), and the risks. Point out clearly if the plan is counter-trend or low grade.
+If the user asks "why buy" or "why sell", explain the matching plan from the snapshot. If that side has no plan, say there is no clean setup and waiting is valid.
+Never promise profit or certainty and never say "guaranteed" or "sure shot". You are not a financial advisor; this is education only.'''
+
+def ask_ai(q, ctx):
+    body = json.dumps({"model": MODEL, "max_tokens": 700, "system": SYSTEM, "messages": [
+        {"role": "user", "content": "Market snapshot (JSON):\n" + json.dumps(ctx)[:6000] + "\n\nUser question: " + q[:400]}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            j = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"API {e.code}: {e.read().decode()[:160]}")
+    return "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text").strip()
 
 HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VK Terminal</title>
@@ -25,6 +50,7 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;b
 #wm{position:absolute;left:12px;bottom:8px;z-index:3;font:900 34px system-ui;letter-spacing:-2px;color:rgba(167,139,250,.35);pointer-events:none}
 #load{position:absolute;inset:0;z-index:6;background:rgba(7,9,14,.85);display:flex;align-items:center;justify-content:center;text-align:center;padding:20px}
 #md{position:absolute;right:76px;top:4px;z-index:4;display:flex;gap:4px}
+#side{display:flex;flex-direction:column;gap:8px}#chat{max-height:240px;overflow:auto;font-size:12px;margin-bottom:6px}.cu{color:#22d3ee;margin:4px 0}.ca{background:#111827;border-radius:8px;padding:6px 8px;margin:4px 0}
 aside{display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 150px);overflow:auto}
 .card{background:#0c1019;border:1px solid #1a2030;border-radius:10px;padding:10px}.card h3{margin:0 0 6px;font-size:13px}
 table{width:100%;border-collapse:collapse}td{padding:2px 0;border-bottom:1px solid #151b29}td:last-child{text-align:right;font-weight:600}
@@ -36,7 +62,9 @@ input{width:100%;background:#0e1320;border:1px solid #232b3d;color:#fff;border-r
 <header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="dot" style="margin-left:auto;font-size:11px"></span><span style="display:flex;gap:4px;align-items:center"><input id="tvp" type="number" step="any" placeholder="TV price" style="width:92px"><div class="b" onclick="matchPrice()">Match</div><div class="b" onclick="clearOff()">✕</div></span><span id="px"></span></header>
 <div class="chips row" id="chips"></div>
 <div class="main"><div><div id="wrap"><div id="c"></div><canvas id="ov"></canvas><div id="wm">VK</div><div id="load"><span id="lt">Loading Binance data...</span></div></div>
-<div id="p2w"><div id="c2"></div><div id="md"></div></div></div><aside id="side"></aside></div>
+<div id="p2w"><div id="c2"></div><div id="md"></div></div></div><aside><div id="side"></div><div class="card" id="ai"><h3>🤖 Ask VK AI</h3><div id="chat"></div>
+<div class="row" style="margin-bottom:6px"><div class="b" onclick="askAI('Why buy here?')">Why buy?</div><div class="b" onclick="askAI('Why sell here?')">Why sell?</div><div class="b" onclick="askAI('Is it safe to enter now?')">Safe now?</div></div>
+<div style="display:flex;gap:5px"><input id="aq" placeholder="Ask: why buy? why sell?" onkeydown="if(event.key==='Enter')askAI()"><div class="b" onclick="askAI()">Ask</div></div></div></aside></div>
 <div id="toast"></div>
 <div class="m" style="text-align:center;font-size:11px;padding:0 10px 14px">Educational tool, not financial advice. Rule-based; no setup is guaranteed. Data: Binance (same feed as TradingView BINANCE:BTCUSDT).</div>
 <script>
@@ -194,22 +222,65 @@ async function init(tk){try{C=await getK();if(tk!==tok)return;ser.setData(C.map(
   if(!Object.keys(FP).length)fpStep=niceStep(avg(C.slice(-14).map(x=>x.h-x.l))/10);const a=analyzeAll(C.slice(0,-1),tf);if(!a)throw'Not enough data';A=a;if(fit){chart.timeScale().fitContent();fit=0}
   p2();lay();side();$('load').style.display='none';lastMsg=0;startPoll(tk);const la=await backfill(tk);if(tk!==tok)return;startWS(tk,la);alerts()}
  catch(e){if(tk===tok){err('⚠ '+e);setTimeout(()=>{if(tk===tok)init(tk)},5000)}}}
-loadOff();bar();frame();init(tok);
+
+// ---- Ask AI: server AI if key is set, otherwise rule-based explanation ----
+let chat=[],aiBusy=0;
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])).replace(/\n/g,'<br>');
+function aiRender(){$('chat').innerHTML=chat.slice(-6).map(m=>`<div class="${m.r==='u'?'cu':'ca'}">${esc(m.t)}</div>`).join('')+(aiBusy?'<div class="m">thinking...</div>':'');$('chat').scrollTop=1e9}
+function snap(){if(!A)return null;const q=p=>p&&{side:p.side,with_trend:p.aligned,zone:[p.ob.bot,p.ob.top],entry:p.entry,stop_loss:p.sl,targets:[p.tp1,p.tp2,p.tp3],liquidity_target:p.liq,rr_to_liquidity:+p.rr.toFixed(1),score_of_5:p.score,reasons:p.reasons},c=C.slice(-10);
+ return{symbol:SY[sy][2],timeframe:tf,price:A.last,bias:A.bias,last_break:A.brks.length?A.brks[A.brks.length-1].txt:null,buy_plan:q(A.buy),sell_plan:q(A.sell),volume_profile:{poc:A.vp.poc,vah:A.vp.vah,val:A.vp.val},delta_last_candle:C.length>1?2*C[C.length-2].b-C[C.length-2].v:0,delta_last_10:c.reduce((a,x)=>a+2*x.b-x.v,0),nearby_sr:A.sr.filter(s=>Math.abs(s.p-A.last)<8*A.atr).slice(0,6).map(s=>[+s.p.toFixed(2),s.n]),atr:+A.atr.toFixed(2)}}
+function explain(q){if(!A)return'Data abhi load ho raha hai.';
+ const s=/sell|short|bech/i.test(q),b=/buy|long|kharid/i.test(q),p=s&&!b?A.sell:b&&!s?A.buy:prim();
+ const bz=A.bias==='bull'?'BULLISH (higher highs/lows)':A.bias==='bear'?'BEARISH (lower highs/lows)':'RANGE (no clear trend)',cd=C.slice(-10).reduce((a,x)=>a+2*x.b-x.v,0);
+ let t=`Market abhi ${bz}${A.brks.length?', last break: '+A.brks[A.brks.length-1].txt:''}.\n`;
+ if(!p)return t+'Is side ke liye abhi koi fresh valid zone nahi hai (zone bana nahi, price ne tod diya, ya bahut door hai). Wait karna valid decision hai.';
+ t+=`${p.side} zone ${f(p.ob.bot)}-${f(p.ob.top)}: ye wo candle hai jahan se pichli baar price tez bhaga tha, isliye yahan dobara reaction aa sakta hai.\n`;
+ t+=p.aligned?'Ye zone trend ke saath hai, isliye relatively better setup.\n':'⚠ Ye trend ke KHILAF (counter-trend) hai, isliye risk zyada hai.\n';
+ if(p.reasons.length)t+='Confluence: '+p.reasons.join(', ')+` (grade ${p.score}/5).\n`;
+ t+=`Delta (last 10 candles) ${cd>=0?'buyers':'sellers'} ke favour me hai (${fv(cd)})`+((cd>=0)===(p.side==='BUY')?', jo is side ko support karta hai.':', jo is side ke against hai, isliye savdhan.')+'\n';
+ t+=`Plan: entry ${f(p.entry)}, SL ${f(p.sl)}, TP 1:2 ${f(p.tp2)}. Candle SL ke bahar close ho to idea galat. Volume POC ${f(A.vp.poc)}.\n`;
+ return t+'Ye guarantee nahi hai, sirf educational reading hai. Risk capital ka chhota hissa (0.5-2%) rakho.'}
+async function askAI(q){q=(q||$('aq').value).trim().slice(0,400);if(!q||aiBusy)return;$('aq').value='';chat.push({r:'u',t:q});aiBusy=1;aiRender();let ans=null,src='',er='';
+ try{const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,ctx:snap()})}),j=await r.json();if(j.answer){ans=j.answer;src='🤖 AI'}else if(j.error&&j.error!=='no_key')er=' ('+j.error+')'}catch(e){}
+ if(!ans){ans=explain(q);src='📘 Rule-based answer (AI key not connected)'+er}
+ chat.push({r:'a',t:src+'\n'+ans});aiBusy=0;aiRender()}
+
+loadOff();bar();frame();init(tok);aiRender();
 
 </script></body></html>"""
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
-    def do_GET(self):
-        body, ct = (b"ok", "text/plain") if self.path.startswith("/health") else (HTML.encode(), "text/html; charset=utf-8")
+    def _send(self, body, ct):
         self.send_response(200); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path.startswith("/health"): return self._send(b"ok", "text/plain")
+        self._send(HTML.encode(), "text/html; charset=utf-8")
+    def do_POST(self):
+        out = {"error": "bad request"}
+        try:
+            if self.path != "/api/ask": raise ValueError("not found")
+            n = int(self.headers.get("Content-Length", "0"))
+            if n > 20000: raise ValueError("too large")
+            d = json.loads(self.rfile.read(n) or b"{}")
+            if not KEY: out = {"error": "no_key"}
+            else:
+                ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+                now = time.time(); h = [t for t in HITS.get(ip, []) if now - t < 3600]
+                if len(h) >= LIMIT: out = {"error": "hourly AI limit reached, try later"}
+                else:
+                    h.append(now); HITS[ip] = h
+                    out = {"answer": ask_ai(str(d.get("q", "")), d.get("ctx"))}
+        except Exception as e:
+            out = {"error": str(e)[:200]}
+        self._send(json.dumps(out).encode(), "application/json")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000")); online = "PORT" in os.environ
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer(("0.0.0.0" if online else "127.0.0.1", port), H) as s:
-        print(f"Running on port {port}")
+        print(f"Running on port {port}  | AI: {'on' if KEY else 'off (no ANTHROPIC_API_KEY)'}")
         if not online:
             try: webbrowser.open(f"http://127.0.0.1:{port}")
             except Exception: pass
