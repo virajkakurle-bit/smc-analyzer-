@@ -15,7 +15,7 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;b
 .b{border:1px solid #232b3d;background:#0e1320;color:#c3cade;border-radius:8px;padding:5px 10px;cursor:pointer;white-space:nowrap;font-size:12px}
 .b.on{background:linear-gradient(135deg,#7c3aed,#0891b2);color:#fff;border-color:transparent}
 .chips{padding:6px 10px}.chips .b{border-radius:999px}.chips .b.on{background:rgba(34,211,238,.15);border-color:#22d3ee;box-shadow:0 0 10px rgba(34,211,238,.3)}
-#px{margin-left:auto;font-size:18px;font-weight:700}.tag{padding:2px 7px;border-radius:6px;font-size:11px;font-weight:700}
+#px{font-size:18px;font-weight:700}.tag{padding:2px 7px;border-radius:6px;font-size:11px;font-weight:700}
 .bull{background:rgba(52,211,153,.2);color:#34d399}.bear{background:rgba(248,113,113,.2);color:#f87171}.rng{background:rgba(251,191,36,.2);color:#fbbf24}
 .main{display:grid;grid-template-columns:1fr 320px;gap:8px;padding:0 10px 10px}
 @media(max-width:900px){.main{grid-template-columns:1fr}}
@@ -33,7 +33,7 @@ input{width:100%;background:#0e1320;border:1px solid #232b3d;color:#fff;border-r
 #toast{position:fixed;right:12px;top:60px;z-index:20;display:flex;flex-direction:column;gap:6px}
 .t{background:#14102a;border:1px solid #7c3aed;border-radius:10px;padding:10px 12px;max-width:320px;box-shadow:0 6px 24px rgba(124,58,237,.4)}
 </style></head><body>
-<header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="px"></span></header>
+<header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="dot" style="margin-left:auto;font-size:11px"></span><span id="px"></span></header>
 <div class="chips row" id="chips"></div>
 <div class="main"><div><div id="wrap"><div id="c"></div><canvas id="ov"></canvas><div id="wm">VK</div><div id="load"><span id="lt">Loading Binance data...</span></div></div>
 <div id="p2w"><div id="c2"></div><div id="md"></div></div></div><aside id="side"></aside></div>
@@ -91,7 +91,7 @@ const $=id=>document.getElementById(id);
 const SY={BTC:['BTCUSDT','spot','₿ BTC'],ETH:['ETHUSDT','spot','Ξ ETH'],XAU:['XAUUSDT','fut','🥇 XAU/USD'],PAXG:['PAXGUSDT','spot','🪙 PAXG']};
 const TF={'1m':60,'5m':300,'15m':900,'1h':3600,'4h':14400,'1d':86400};
 const HOST={spot:['https://api.binance.com/api/v3','https://data-api.binance.vision/api/v3'],fut:['https://fapi.binance.com/fapi/v1']};
-const WSH={spot:'wss://stream.binance.com:9443/stream?streams=',fut:'wss://fstream.binance.com/stream?streams='};
+const WSH={spot:'wss://stream.binance.com:443/stream?streams=',fut:'wss://fstream.binance.com/stream?streams='};
 let sy='BTC',tf='5m',C=[],A=null,FP={},fpStep=1,fpReady=0,ws=null,tok=0,p2m='Delta',seen={},log=[],sel='auto',fit=1;
 const L={zones:1,plan:1,struct:1,sr:0,fib:0,vp:0,fp:0,both:0,vol:1};
 const CHIPS=[['zones','🟩 Zones'],['plan','🎯 Plan'],['struct','🧱 Structure'],['sr','📏 S/R'],['fib','🌀 Fib'],['vp','🧬 Volume Profile'],['fp','⚡ Footprint'],['both','↔ Both sides'],['alert','🔔 Alerts']];
@@ -169,15 +169,20 @@ function fpAdd(d){const t=Math.floor(d.T/1000/TF[tf])*TF[tf],k=Math.round(+d.p/f
 async function backfill(tk){const[s,m]=SY[sy],h=HOST[m][0];let from=null,last=0;
  for(let i=0;i<8&&tk===tok;i++){try{const u=from==null?`${h}/aggTrades?symbol=${s}&startTime=${C[C.length-1].t*1000}&limit=1000`:`${h}/aggTrades?symbol=${s}&fromId=${from}&limit=1000`;const r=await (await fetch(u)).json();if(!Array.isArray(r)||!r.length)break;
   r.forEach(d=>{if(d.T>=C[C.length-1].t*1000)fpAdd(d);last=d.a});from=last+1;if(r.length<1000)break}catch(e){break}}return last}
-function startWS(tk,lastA){const[s,m]=SY[sy],q=s.toLowerCase();ws=new WebSocket(WSH[m]+`${q}@kline_${tf}/${q}@aggTrade`);
+function startWS(tk,lastA){lastMsg=0;startPoll(tk);const[s,m]=SY[sy],q=s.toLowerCase();ws=new WebSocket(WSH[m]+`${q}@kline_${tf}/${q}@aggTrade`);
  ws.onmessage=e=>{if(tk!==tok)return;const j=JSON.parse(e.data),d=j.data;if(!d)return;
-  if(d.e==='aggTrade'){if(d.a>lastA){lastA=d.a;fpAdd(d)}return}
-  const k=d.k,c={t:k.t/1000,o:+k.o,h:+k.h,l:+k.l,c:+k.c,v:+k.v,b:+k.V},l=C[C.length-1];
-  if(l.t===c.t)C[C.length-1]=c;else{C.push(c);if(C.length>1500)C.shift()}
-  ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});const dl=2*c.b-c.v;if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
-  $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
-  if(k.x){recalc();p2()}else if(A){A.last=c.c;alerts()}};
+  lastMsg=Date.now();if(d.e==='aggTrade'){if(d.a>lastA){lastA=d.a;fpAdd(d)}return}
+  const k=d.k;onK({t:k.t/1000,o:+k.o,h:+k.h,l:+k.l,c:+k.c,v:+k.v,b:+k.V},k.x)};
  ws.onclose=()=>{if(tk===tok)setTimeout(()=>{if(tk===tok)reset(1)},2000)}}
+let lastMsg=0,poll=null;
+function onK(c,x){const l=C[C.length-1];if(l.t===c.t)C[C.length-1]=c;else if(c.t>l.t){C.push(c);if(C.length>1500)C.shift()}else return;
+ ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});const dl=2*c.b-c.v;if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
+ $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
+ if(x){recalc();p2()}else if(A){A.last=c.c;alerts()}}
+function setDot(live){$('dot').innerHTML=live?'<span class="g">● LIVE</span>':'<span class="a">● POLLING (websocket blocked, REST every 2s)</span>'}
+function startPoll(tk){clearInterval(poll);const[s,m]=SY[sy];poll=setInterval(async()=>{if(tk!==tok)return clearInterval(poll);const live=Date.now()-lastMsg<4000;setDot(live);if(live)return;
+ try{const r=await(await fetch(`${HOST[m][0]}/klines?symbol=${s}&interval=${tf}&limit=2`)).json(),q=r.map(x=>({t:x[0]/1000,o:+x[1],h:+x[2],l:+x[3],c:+x[4],v:+x[5],b:+x[9]}));
+  onK(q[0],false);const n0=C.length;onK(q[1],false);if(C.length>n0){recalc();p2()}}catch(e){}},2000)}
 function recalc(){const D=C.slice(0,-1),a=analyzeAll(D,tf);if(a){A=a;lay();side();alerts()}}   // analysis only on CLOSED candles: nothing shifts mid-candle
 function reset(keep){tok++;if(ws){try{ws.close()}catch(e){}}A=null;if(!keep){FP={};seen={};fit=1}ser.setData([]);bar();err('Loading Binance data...');init(tok)}
 async function init(tk){try{C=await getK();if(tk!==tok)return;ser.setData(C.map(x=>({time:x.t,open:x.o,high:x.h,low:x.l,close:x.c})));
