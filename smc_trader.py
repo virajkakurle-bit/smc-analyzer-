@@ -1,3 +1,80 @@
+#!/usr/bin/env python3
+"""VK Terminal server. Serves the dashboard; market data comes straight from Binance in your browser.
+Optional AI: set env var ANTHROPIC_API_KEY (and optionally AI_MODEL) to enable the "Ask VK AI" box.
+Run locally: python smc_trader.py  -> http://127.0.0.1:8000
+Educational tool, not financial advice."""
+import os, json, time, http.server, socketserver, webbrowser, urllib.request, urllib.error
+
+KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
+HITS = {}      # ip -> [timestamps], simple abuse limit so a public site cannot drain your API credits
+LIMIT = int(os.environ.get("AI_LIMIT_PER_HOUR", "30"))
+
+SYSTEM = '''You explain a rule-based Smart Money Concepts reading shown inside an educational trading terminal.
+Use ONLY the JSON snapshot you are given. Never invent prices, levels or data.
+Answer in the same language/style as the user's question (Hinglish, Hindi or English). Keep it under 150 words, plain text, no tables.
+Explain why the zone exists (trend, liquidity sweep, order block, delta, volume profile), what would invalidate it (a close beyond the stop loss), and the risks. Point out clearly if the plan is counter-trend or low grade.
+If the user asks "why buy" or "why sell", explain the matching plan from the snapshot. If that side has no plan, say there is no clean setup and waiting is valid.
+Never promise profit or certainty and never say "guaranteed" or "sure shot". You are not a financial advisor; this is education only.'''
+
+def ask_ai(q, ctx):
+    body = json.dumps({"model": MODEL, "max_tokens": 700, "system": SYSTEM, "messages": [
+        {"role": "user", "content": "Market snapshot (JSON):\n" + json.dumps(ctx)[:6000] + "\n\nUser question: " + q[:400]}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            j = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"API {e.code}: {e.read().decode()[:160]}")
+    return "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text").strip()
+
+HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VK Terminal</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#07090e;color:#e6e9f2;font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid #1a2030;background:linear-gradient(90deg,#120a26,#07121c)}
+.logo{font-weight:900;font-size:20px;letter-spacing:-1px;background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent;margin-right:4px}
+.row{display:flex;gap:5px;overflow-x:auto;max-width:100%}
+.b{border:1px solid #232b3d;background:#0e1320;color:#c3cade;border-radius:8px;padding:5px 10px;cursor:pointer;white-space:nowrap;font-size:12px}
+.b.on{background:linear-gradient(135deg,#7c3aed,#0891b2);color:#fff;border-color:transparent}
+.chips{padding:6px 10px}.chips .b{border-radius:999px}.chips .b.on{background:rgba(34,211,238,.15);border-color:#22d3ee;box-shadow:0 0 10px rgba(34,211,238,.3)}
+#px{font-size:18px;font-weight:700}.tag{padding:2px 7px;border-radius:6px;font-size:11px;font-weight:700}
+.bull{background:rgba(52,211,153,.2);color:#34d399}.bear{background:rgba(248,113,113,.2);color:#f87171}.rng{background:rgba(251,191,36,.2);color:#fbbf24}
+.main{display:grid;grid-template-columns:1fr 320px;gap:8px;padding:0 10px 10px}
+@media(max-width:900px){.main{grid-template-columns:1fr}}
+#wrap,#p2w{position:relative;border:1px solid #1a2030;border-radius:10px;overflow:hidden;background:#090c14}
+#wrap{height:calc(100vh - 330px);min-height:360px}#p2w{height:140px;margin-top:6px}
+#c,#ov,#c2{position:absolute;inset:0}#ov{pointer-events:none;z-index:2}
+#wm{position:absolute;left:12px;bottom:8px;z-index:3;font:900 34px system-ui;letter-spacing:-2px;color:rgba(167,139,250,.35);pointer-events:none}
+#load{position:absolute;inset:0;z-index:6;background:rgba(7,9,14,.85);display:flex;align-items:center;justify-content:center;text-align:center;padding:20px}
+#md{position:absolute;right:76px;top:4px;z-index:4;display:flex;gap:4px}
+#side{display:flex;flex-direction:column;gap:8px}#chat{max-height:240px;overflow:auto;font-size:12px;margin-bottom:6px}.cu{color:#22d3ee;margin:4px 0}.ca{background:#111827;border-radius:8px;padding:6px 8px;margin:4px 0}
+aside{display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 150px);overflow:auto}
+.card{background:#0c1019;border:1px solid #1a2030;border-radius:10px;padding:10px}.card h3{margin:0 0 6px;font-size:13px}
+table{width:100%;border-collapse:collapse}td{padding:2px 0;border-bottom:1px solid #151b29}td:last-child{text-align:right;font-weight:600}
+.g{color:#34d399}.r{color:#f87171}.a{color:#fbbf24}.m{color:#7d869c}
+input{width:100%;background:#0e1320;border:1px solid #232b3d;color:#fff;border-radius:6px;padding:5px;font-size:13px}
+#toast{position:fixed;right:12px;top:60px;z-index:20;display:flex;flex-direction:column;gap:6px}
+.t{background:#14102a;border:1px solid #7c3aed;border-radius:10px;padding:10px 12px;max-width:320px;box-shadow:0 6px 24px rgba(124,58,237,.4)}
+</style></head><body>
+<header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="dot" style="margin-left:auto;font-size:11px"></span><span style="display:flex;gap:4px;align-items:center"><input id="tvp" type="number" step="any" placeholder="TV price" style="width:92px"><div class="b" onclick="matchPrice()">Match</div><div class="b" onclick="clearOff()">✕</div></span><span id="px"></span></header>
+<div class="chips row" id="chips"></div>
+<div id="diag" class="m" style="padding:2px 12px;font-size:11px"></div>
+<div class="main"><div><div id="wrap"><div id="c"></div><canvas id="ov"></canvas><div id="wm">VK</div><div id="load"><span id="lt">Loading Binance data...</span></div></div>
+<div id="p2w"><div id="c2"></div><div id="md"></div></div></div><aside><div id="side"></div><div class="card" id="demo"><h3>🧪 Demo account <span class="m">(simulated, not a broker)</span></h3><div id="acs"></div>
+<div style="display:flex;gap:5px;margin:6px 0;align-items:center"><span class="m">Start $</span><input id="d_b" type="number" min="10" max="1000" value="100" style="width:80px"><div class="b" onclick="resetAc()">Reset</div></div>
+<div class="row"><div class="b on" id="d_buy" onclick="tkSd('BUY')">BUY</div><div class="b" id="d_sell" onclick="tkSd('SELL')">SELL</div><select id="d_ty" style="background:#0e1320;color:#fff;border:1px solid #232b3d;border-radius:8px"><option value="mkt">Market</option><option value="lim">Limit</option></select></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:6px 0" oninput="tkPv()"><span><span class="m">Limit price</span><input id="d_e" type="number" step="any"></span><span><span class="m">Stop loss</span><input id="d_s" type="number" step="any"></span><span><span class="m">Take profit</span><input id="d_t" type="number" step="any"></span><span><span class="m">Risk $</span><input id="d_r" type="number" step="any" value="2"></span><span><span class="m">Leverage x</span><input id="d_l" type="number" value="10"></span><span><span class="m">Trail at (R)</span><input id="d_a" type="number" step="0.1" value="1.1"></span></div>
+<label class="m"><input id="d_n" type="checkbox" style="width:auto" checked> Trailing stop: move SL to breakeven at the R above</label>
+<div id="d_pv" class="m" style="margin:6px 0"></div><div style="display:flex;gap:5px"><div class="b" onclick="tkGo()">Place demo order</div><div class="b" onclick="tkPlan()">Use AI plan</div></div><div id="acp" style="margin-top:8px"></div></div>
+<div class="card" id="ai"><h3>🤖 Ask VK AI</h3><div id="chat"></div>
+<div class="row" style="margin-bottom:6px"><div class="b" onclick="askAI('Why buy here?')">Why buy?</div><div class="b" onclick="askAI('Why sell here?')">Why sell?</div><div class="b" onclick="askAI('Is it safe to enter now?')">Safe now?</div></div>
+<div style="display:flex;gap:5px"><input id="aq" placeholder="Ask: why buy? why sell?" onkeydown="if(event.key==='Enter')askAI()"><div class="b" onclick="askAI()">Ask</div></div></div></aside></div>
+<div id="toast"></div>
+<div class="m" style="text-align:center;font-size:11px;padding:0 10px 14px">Educational tool, not financial advice. Rule-based; no setup is guaranteed. Data: Binance (same feed as TradingView BINANCE:BTCUSDT).</div>
+<script>
 const avg=(a)=>a.reduce((s,x)=>s+x,0)/(a.length||1);
 const niceStep=x=>{const e=Math.pow(10,Math.floor(Math.log10(x))),m=x/e;return(m<1.5?1:m<3.5?2:m<7.5?5:10)*e};
 function sw(D,k){const H=[],L=[];for(let i=k;i<D.length-k;i++){let h=1,l=1;for(let j=1;j<=k;j++){if(D[i].h<=D[i-j].h||D[i].h<D[i+j].h)h=0;if(D[i].l>=D[i-j].l||D[i].l>D[i+j].l)l=0}if(h)H.push(i);if(l)L.push(i)}return[H,L]}
@@ -73,3 +150,213 @@ function stepAcct(a,bid,ask,lev,slip){const ev=[];
   if(p.sl!=null&&(L?px<=p.sl:px>=p.sl)){const r=closePos(a,p,p.sl,'SL',slip);ev.push('#'+p.id+' stop hit, P&L '+r.toFixed(2))}
   else if(p.tp!=null&&(L?px>=p.tp:px<=p.tp)){const r=closePos(a,p,p.tp,'TP',0);ev.push('#'+p.id+' target hit, P&L '+r.toFixed(2))}});
  return ev}
+
+const $=id=>document.getElementById(id);
+const SY={BTC:['BTCUSDT','spot','₿ BTC'],ETH:['ETHUSDT','spot','Ξ ETH'],XAU:['XAUUSDT','fut','🥇 XAU/USD'],PAXG:['PAXGUSDT','spot','🪙 PAXG']};
+const TF={'1m':60,'5m':300,'15m':900,'1h':3600,'4h':14400,'1d':86400};
+const HOST={spot:['https://api.binance.com/api/v3','https://data-api.binance.vision/api/v3'],fut:['https://fapi.binance.com/fapi/v1']};
+const WSH={spot:'wss://stream.binance.com:443/stream?streams=',fut:'wss://fstream.binance.com/market/stream?streams='};
+let OFF=0,sy='BTC',tf='5m',C=[],A=null,FP={},fpStep=1,fpReady=0,ws=null,tok=0,p2m='Delta',seen={},log=[],sel='auto',fit=1;
+const L={zones:1,plan:1,struct:1,sr:0,fib:0,vp:0,fp:0,both:0,vol:1};
+const CHIPS=[['zones','🟩 Zones'],['plan','🎯 Plan'],['struct','🧱 Structure'],['sr','📏 S/R'],['fib','🌀 Fib'],['vp','🧬 Volume Profile'],['fp','⚡ Footprint'],['both','↔ Both sides'],['alert','🔔 Alerts']];
+const f=n=>n==null?'-':(+n).toLocaleString(undefined,{maximumFractionDigits:Math.abs(n)>=1000?2:Math.abs(n)>=1?3:5});
+const fv=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(1)+'K':v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);
+function bar(){
+ $('syms').innerHTML=Object.entries(SY).map(([k,v])=>`<div class="b ${k===sy?'on':''}" onclick="sy='${k}';reset()">${v[2]}</div>`).join('');
+ $('tfs').innerHTML=Object.keys(TF).map(k=>`<div class="b ${k===tf?'on':''}" onclick="tf='${k}';reset()">${k}</div>`).join('');
+ $('chips').innerHTML=CHIPS.map(([k,n])=>`<div class="b ${L[k]?'on':''}" onclick="tog('${k}')">${n}</div>`).join('');
+ $('md').innerHTML=['Delta','Volume','CVD'].map(m=>`<div class="b ${m===p2m?'on':''}" onclick="p2m='${m}';bar();p2()">${m}</div>`).join('');
+}
+function tog(k){if(k==='alert'){L.alert=L.alert?0:1;if(L.alert&&window.Notification&&Notification.permission==='default')Notification.requestPermission()}else L[k]=L[k]?0:1;bar();lay();side()}
+const tfmt=(t,ty)=>{const d=new Date(t*1000);return ty>=3?d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}):d.toLocaleDateString([],{day:'2-digit',month:'short'})};
+const opt=el=>({autoSize:true,layout:{background:{color:'rgba(0,0,0,0)'},textColor:'#7d869c'},grid:{vertLines:{color:'rgba(255,255,255,.03)'},horzLines:{color:'rgba(255,255,255,.03)'}},rightPriceScale:{borderColor:'#1a2030'},timeScale:{timeVisible:true,rightOffset:6,borderColor:'#1a2030',tickMarkFormatter:tfmt},localization:{timeFormatter:t=>new Date(t*1000).toLocaleString()}});
+const chart=LightweightCharts.createChart($('c'),opt());chart.priceScale('right').applyOptions({scaleMargins:{top:.06,bottom:.06}});
+const ser=chart.addCandlestickSeries({upColor:'#22c55e',downColor:'#ef4444',wickUpColor:'#22c55e',wickDownColor:'#ef4444',borderVisible:false});
+const chart2=LightweightCharts.createChart($('c2'),opt());const s2=chart2.addHistogramSeries({priceFormat:{type:'volume'}}),l2=chart2.addLineSeries({color:'#22d3ee',lineWidth:2,visible:false});
+let sg=0;const sync=(a,b)=>a.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(sg||!r)return;sg=1;b.timeScale().setVisibleLogicalRange(r);sg=0});sync(chart,chart2);sync(chart2,chart);
+let lines=[];const pl=(p,c,t,st,w)=>lines.push(ser.createPriceLine({price:p,color:c,lineWidth:w||1,lineStyle:st??2,axisLabelVisible:true,title:t}));
+const prim=()=>!A?null:sel==='buy'?A.buy:sel==='sell'?A.sell:A.bias==='bull'?A.buy:A.bias==='bear'?A.sell:null;
+function lay(){lines.forEach(l=>ser.removePriceLine(l));lines=[];if(!A)return;const p=prim();
+ if(L.plan&&p){pl(p.entry,'#60a5fa','ENTRY',0,2);pl(p.sl,'#f87171','SL',0,2);pl(p.tp1,'#34d399','TP 1:1',2);pl(p.tp2,'#34d399','TP 1:2',0,2);pl(p.tp3,'#34d399','TP 1:3',2)}
+ if(L.vp)pl(A.vp.poc,'#fde047','POC',0,2);
+ ser.setMarkers(L.struct?[...A.sh.map(x=>({time:x.t,position:'aboveBar',color:'#f59e0b',shape:'circle',text:'SH'})),...A.sl.map(x=>({time:x.t,position:'belowBar',color:'#38bdf8',shape:'circle',text:'SL'}))].sort((a,b)=>a.time-b.time):[])}
+function p2(){const dl=x=>2*x.b-x.v;let c=0;
+ if(p2m==='CVD'){l2.applyOptions({visible:true});s2.setData([]);l2.setData(C.map(x=>({time:x.t,value:(c+=dl(x))})))}
+ else{l2.applyOptions({visible:false});l2.setData([]);s2.setData(C.map(x=>p2m==='Delta'?{time:x.t,value:dl(x),color:dl(x)>=0?'#22c55e':'#ef4444'}:{time:x.t,value:x.v,color:x.b>=x.v-x.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'}))}}
+// ---- overlay ----
+const ov=$('ov'),cx=ov.getContext('2d');
+function frame(){try{flush();draw()}catch(e){}requestAnimationFrame(frame)}
+function draw(){const w=$('wrap'),d=devicePixelRatio||1,W=w.clientWidth,H=w.clientHeight;
+ if(ov.width!==Math.round(W*d)||ov.height!==Math.round(H*d)){ov.width=Math.round(W*d);ov.height=Math.round(H*d)}
+ cx.setTransform(d,0,0,d,0,0);cx.clearRect(0,0,W,H);if(!A||C.length<3)return;
+ let R=W-60;try{R=W-chart.priceScale('right').width()}catch(e){}
+ const ts=chart.timeScale(),X=t=>{const x=ts.timeToCoordinate(t);return x==null?-9999:x},Y=p=>ser.priceToCoordinate(p),sp=Math.abs(X(C[C.length-1].t)-X(C[C.length-2].t));
+ const box=(top,bot,t,fill,st,lb,dash)=>{const y1=Y(top),y2=Y(bot);if(y1==null||y2==null)return;const x1=Math.max(0,X(t)),yt=Math.min(y1,y2),h=Math.max(Math.abs(y2-y1),2);cx.fillStyle=fill;cx.fillRect(x1,yt,R-x1,h);cx.strokeStyle=st;cx.lineWidth=1;cx.setLineDash(dash?[4,3]:[]);cx.strokeRect(x1,yt,R-x1,h);cx.setLineDash([]);if(lb){cx.fillStyle=st;cx.font='bold 11px system-ui';cx.fillText(lb,x1+6,yt+12)}};
+ const hl=(p,c,lb,x0,dash)=>{const y=Y(p);if(y==null)return;cx.strokeStyle=c;cx.lineWidth=1;cx.setLineDash(dash?[4,4]:[]);cx.beginPath();cx.moveTo(x0||0,y);cx.lineTo(R,y);cx.stroke();cx.setLineDash([]);if(lb){cx.fillStyle=c;cx.font='11px system-ui';cx.fillText(lb,(x0||0)+6,y-3)}};
+ if(L.vp){const v=A.vp,mx=Math.max(...v.B.map((b,i)=>b+v.S[i]))||1,mw=R*.2;v.B.forEach((b,i)=>{const y1=Y(v.lo+(i+1)*v.step),y2=Y(v.lo+i*v.step);if(y1==null||y2==null)return;const h=Math.max(y2-y1-1,1),s=v.S[i],wb=mw*b/mx,wsl=mw*s/mx;cx.fillStyle='rgba(239,68,68,.4)';cx.fillRect(R-wsl,y1,wsl,h);cx.fillStyle='rgba(34,197,94,.4)';cx.fillRect(R-wsl-wb,y1,wb,h)});hl(v.poc,'#fde047','POC (best volume)',R-mw-100);hl(v.vah,'#fde047','VAH',R-mw-30,1);hl(v.val,'#fde047','VAL',R-mw-30,1)}
+ if(L.sr)A.sr.filter(s=>Math.abs(s.p-A.last)<10*A.atr).forEach(s=>{const c=s.p>A.last?'#f472b6':'#38bdf8';hl(s.p,c,(s.p>A.last?'R ':'S ')+f(s.p)+' x'+s.n,0,1)});
+ if(L.fib&&A.fib){const F=A.fib,r=F.hi-F.lo,lv=x=>F.up?F.hi-x*r:F.lo+x*r;box(lv(.618),lv(.786),F.t,'rgba(250,204,21,.12)','#facc15','OTE .618-.786');[.5,1].forEach(x=>hl(lv(x),'#facc15',x===.5?'Fib 0.5':'Fib 1.0',X(F.t),1))}
+ if(L.zones){const ps=[prim()];if(L.both){ps.push(A.buy,A.sell)}[...new Set(ps)].filter(Boolean).forEach(p=>{const b=p.side==='BUY';box(p.ob.top,p.ob.bot,p.ob.t,b?'rgba(34,197,94,.2)':'rgba(239,68,68,.2)',b?'#22c55e':'#ef4444',(b?'BUY ZONE ▲':'SELL ZONE ▼')+(p.aligned?' ★':' (counter)'))})}
+ if(L.struct)A.brks.forEach(b=>{const x1=X(b.t1),x2=X(b.t2),y=Y(b.p);if(y==null)return;cx.strokeStyle=b.up?'#34d399':'#f87171';cx.setLineDash([3,3]);cx.beginPath();cx.moveTo(x1,y);cx.lineTo(x2,y);cx.stroke();cx.setLineDash([]);cx.fillStyle=cx.strokeStyle;cx.font='bold 11px system-ui';cx.fillText(b.txt,(x1+x2)/2-10,y+(b.up?-4:12))});
+ if(L.fp&&sp>=44)C.forEach(c=>{const m=FP[c.t],x=X(c.t);if(!m||x<-sp||x>R+sp)return;const bw=sp*.46;let pk=null,pv=0;m.forEach((v,k)=>{if(v[0]+v[1]>pv){pv=v[0]+v[1];pk=k}});
+  m.forEach((v,k)=>{const p=k*fpStep,y1=Y(p+fpStep/2),y2=Y(p-fpStep/2);if(y1==null||y2==null)return;const h=y2-y1;if(h<8)return;const im=v[1]>=3*v[0]?1:v[0]>=3*v[1]?-1:0;
+   cx.fillStyle=im>0?'rgba(34,197,94,.4)':im<0?'rgba(239,68,68,.4)':'rgba(255,255,255,.06)';cx.fillRect(x-bw,y1,bw*2,h-1);if(k===pk){cx.strokeStyle='#fde047';cx.strokeRect(x-bw,y1,bw*2,h-1)}
+   cx.fillStyle='#e5e7eb';cx.font=Math.min(11,h-1)+'px system-ui';cx.textAlign='right';cx.fillText(fv(v[0]),x-2,y1+h-2);cx.textAlign='left';cx.fillText(fv(v[1]),x+2,y1+h-2)})});
+ if(L.fp&&sp<44){cx.fillStyle='#fbbf24';cx.font='12px system-ui';cx.fillText('Zoom in (scroll) to see footprint numbers',70,24)}
+}
+// ---- panels ----
+function side(){if(!A){$('side').innerHTML='';return}
+ const bal=+($('bal')?$('bal').value:100)||100,rp=+($('rp')?$('rp').value:2)||2,p=prim(),cd=C.slice(-10).reduce((a,x)=>a+2*x.b-x.v,0),d1=C[C.length-2]?2*C[C.length-2].b-C[C.length-2].v:0,v=A.vp;
+ const pc=(p,nm)=>{if(!p)return`<div class="card"><h3>${nm}</h3><p class="m">No fresh, valid zone right now. Waiting is a valid decision.</p></div>`;
+  const rk=bal*rp/100,u=rk/Math.abs(p.entry-p.sl),g=p.score>=4?['A','g']:p.score==3?['B','a']:['C','r'];
+  return`<div class="card"><h3>${p.side==='BUY'?'🟢':'🔴'} ${nm} <span class="${g[1]}">grade ${g[0]} (${p.score}/5)</span></h3><div class="m">${p.aligned?'★ with trend':'⚠ counter-trend, riskier'}</div><table>
+  <tr><td>Entry (limit)</td><td>${f(p.entry)}</td></tr><tr><td>Stop loss</td><td class="r">${f(p.sl)}</td></tr><tr><td>TP 1:1 · 1:2 · 1:3</td><td class="g">${f(p.tp1)} · ${f(p.tp2)} · ${f(p.tp3)}</td></tr>
+  <tr><td>Liquidity target</td><td>${p.liq?f(p.liq)+' ('+p.rr.toFixed(1)+'R)':'none'}</td></tr><tr><td>SL to breakeven at 1.1R</td><td>${f(p.trail)}</td></tr>
+  <tr><td>Size (units) / value</td><td>${u.toFixed(5)} / $${f(u*p.entry)}</td></tr><tr><td>Leverage needed</td><td>${(u*p.entry/bal).toFixed(1)}x</td></tr></table><div class="m">${p.reasons.join(' · ')||'no extra confluence'}</div></div>`};
+ const keep=document.activeElement&&document.activeElement.id;
+ $('side').innerHTML=`<div class="card"><h3>Market: <span class="tag ${A.bias}">${A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'}</span> ${A.brks.length?'<span class="tag rng">'+A.brks.slice(-1)[0].txt+'</span>':''}</h3>
+ <table><tr><td>Price offset (match)</td><td>${OFF>=0?'+':''}${OFF}</td></tr><tr><td>Volume POC (fixed per session)</td><td class="a">${f(v.poc)}</td></tr><tr><td>Value area</td><td>${f(v.val)} – ${f(v.vah)}</td></tr><tr><td>Last candle delta</td><td class="${d1>=0?'g':'r'}">${fv(d1)}</td></tr><tr><td>Delta (last 10)</td><td class="${cd>=0?'g':'r'}">${fv(cd)}</td></tr></table></div>`
+ +(p?pc(p,p.side==='BUY'?'Buy plan':'Sell plan')+(L.both?pc(p===A.buy?A.sell:A.buy,'Other side'):''):'<div class="card"><h3>Range market</h3><p class="m">No clear trend, so no main plan. Both sides shown below for reference.</p></div>'+pc(A.buy,'Buy plan')+pc(A.sell,'Sell plan'))
+ +`<div class="card"><h3>🧮 Risk</h3><div style="display:flex;gap:6px"><div><span class="m">Balance $</span><input id="bal" type="number" value="${bal}"></div><div><span class="m">Risk %</span><input id="rp" type="number" value="${rp}"></div></div>${rp>=5?`<p class="r">High risk: 5 losses in a row = about -${((1-Math.pow(1-rp/100,5))*100).toFixed(0)}% of account.</p>`:''}</div>`
+ +`<div class="card"><h3>🔔 Alerts ${L.alert?'(on)':'(off, tap chip)'}</h3>${log.slice(0,6).map(x=>'<div class="m">'+x+'</div>').join('')||'<div class="m">Nothing yet. Alerts fire when a new zone forms and when price enters it.</div>'}</div>`;
+ ['bal','rp'].forEach(i=>{$(i).oninput=side});if(keep==='bal'||keep==='rp')$(keep).focus()}
+function notify(msg){log.unshift(new Date().toLocaleTimeString()+' '+msg);side();if(!L.alert)return;const t=document.createElement('div');t.className='t';t.textContent=msg;$('toast').appendChild(t);setTimeout(()=>t.remove(),12000);
+ try{const a=new(window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator();o.connect(a.destination);o.frequency.value=880;o.start();setTimeout(()=>o.stop(),250)}catch(e){}
+ try{if(Notification.permission==='granted')new Notification('VK Terminal',{body:msg})}catch(e){}}
+function alerts(){if(!A)return;const k=SY[sy][2]+' '+tf;[A.buy,A.sell].forEach(p=>{if(!p||!(p.aligned||L.both))return;const id=sy+tf+p.id;
+  if(!seen[id]){seen[id]=1;notify(`${k}: new ${p.side} zone ${f(p.ob.bot)}-${f(p.ob.top)} | SL ${f(p.sl)} | TP 1:2 ${f(p.tp2)}`)}
+  const c=C[C.length-1];if(!seen[id+'t']&&c.l<=p.ob.top&&c.h>=p.ob.bot){seen[id+'t']=1;notify(`${k}: price ENTERED ${p.side} zone. Entry ${f(p.entry)} SL ${f(p.sl)}`)}})}
+// ---- data ----
+const ft=(u)=>fetch(u,{signal:AbortSignal.timeout(5000)});
+const err=m=>{$('load').style.display='flex';$('lt').textContent=m};
+async function getK(){const[s,m]=SY[sy],es=[];for(const h of HOST[m]){try{const r=await fetch(`${h}/klines?symbol=${s}&interval=${tf}&limit=1000`);if(!r.ok)throw'HTTP '+r.status;return(await r.json()).map(x=>({t:x[0]/1000,o:+x[1]+OFF,h:+x[2]+OFF,l:+x[3]+OFF,c:+x[4]+OFF,v:+x[5],b:+x[9]}))}catch(e){es.push(h.split('/')[2]+': '+e)}}throw es.join(' | ')+'. Binance may be blocked on this network (try another network/VPN).'}
+function fpAdd(d){const t=Math.floor(d.T/1000/TF[tf])*TF[tf],k=Math.round((+d.p+OFF)/fpStep),m=FP[t]||(FP[t]=new Map()),v=m.get(k)||[0,0];v[d.m?0:1]+=+d.q;m.set(k,v)}
+async function backfill(tk){const[s,m]=SY[sy],h=HOST[m][0];let from=null,last=0;
+ for(let i=0;i<8&&tk===tok;i++){try{const u=from==null?`${h}/aggTrades?symbol=${s}&startTime=${C[C.length-1].t*1000}&limit=1000`:`${h}/aggTrades?symbol=${s}&fromId=${from}&limit=1000`;const r=await (await ft(u)).json();if(!Array.isArray(r)||!r.length)break;
+  r.forEach(d=>{if(d.T>=C[C.length-1].t*1000)fpAdd(d);last=d.a});from=last+1;if(r.length<1000)break}catch(e){break}}return last}
+function startWS(tk,lastA){const[s,m]=SY[sy],q=s.toLowerCase();ws=new WebSocket(WSH[m]+`${q}@kline_${tf}/${q}@aggTrade`);
+ ws.onmessage=e=>{if(tk!==tok)return;const j=JSON.parse(e.data),d=j.data;if(!d)return;
+  lastMsg=Date.now();if(d.e==='aggTrade'){lastLat=Date.now()-d.E;if(d.a>lastA){lastA=d.a;fpAdd(d);tick(d)}return}
+  const k=d.k;onK({t:k.t/1000,o:+k.o+OFF,h:+k.h+OFF,l:+k.l+OFF,c:+k.c+OFF,v:+k.v,b:+k.V},k.x)};
+ ws.onclose=()=>{if(tk===tok)setTimeout(()=>{if(tk===tok)startWS(tk,lastA)},3000)}}
+let lastMsg=0,poll=null,dirty=0,lastAl=0;
+function tick(d){const l=C[C.length-1];if(!l||Math.floor(d.T/1000/TF[tf])*TF[tf]!==l.t)return;const p=+d.p+OFF,q=+d.q;l.c=p;if(p>l.h)l.h=p;if(p<l.l)l.l=p;l.v+=q;if(!d.m)l.b+=q;dirty=1;lastUpd=Date.now()}
+function flush(){if(!dirty||!C.length)return;dirty=0;const c=C[C.length-1],dl=2*c.b-c.v;ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});
+ if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
+ $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
+ if(A){A.last=c.c;if(Date.now()-lastAl>500){lastAl=Date.now();alerts()}}acctTick()}
+function onK(c,x){lastUpd=Date.now();const l=C[C.length-1];if(l.t===c.t)C[C.length-1]=c;else if(c.t>l.t){C.push(c);if(C.length>1500)C.shift()}else return;
+ ser.update({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c});const dl=2*c.b-c.v;if(p2m==='Delta')s2.update({time:c.t,value:dl,color:dl>=0?'#22c55e':'#ef4444'});else if(p2m==='Volume')s2.update({time:c.t,value:c.v,color:c.b>=c.v-c.b?'rgba(34,197,94,.6)':'rgba(239,68,68,.6)'});
+ $('px').innerHTML=`${f(c.c)} <span class="tag ${A?A.bias:'rng'}">${A?(A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'):''}</span>`;
+ if(x){recalc();p2()}else if(A){A.last=c.c;alerts()}}
+let lastUpd=0,dErr='';function setDot(live){const t=lastUpd?new Date(lastUpd).toLocaleTimeString():'-';$('dot').innerHTML=(live?'<span class="g">● LIVE</span>':'<span class="a">● POLLING (REST 1s)</span>')+` <span class="m">${t}</span>`+(dErr?` <span class="r">${dErr}</span>`:'')}
+function startPoll(tk){clearInterval(poll);const[s,m]=SY[sy];poll=setInterval(async()=>{if(tk!==tok)return clearInterval(poll);const live=Date.now()-lastMsg<4000;setDot(live);if(live)return;
+ try{const r=await(await fetch(`${HOST[m][0]}/klines?symbol=${s}&interval=${tf}&limit=2`)).json(),q=r.map(x=>({t:x[0]/1000,o:+x[1]+OFF,h:+x[2]+OFF,l:+x[3]+OFF,c:+x[4]+OFF,v:+x[5],b:+x[9]}));
+  dErr='';onK(q[0],false);const n0=C.length;onK(q[1],false);if(C.length>n0){recalc();p2()}}catch(e){dErr='REST error: '+e}setDot(false)},1000)}
+function recalc(){const D=C.slice(0,-1),a=analyzeAll(D,tf);if(a){A=a;lay();side();alerts()}}   // analysis only on CLOSED candles: nothing shifts mid-candle
+function loadOff(){try{OFF=+localStorage.getItem('off_'+sy)||0}catch(e){OFF=0}}
+function setOff(v){OFF=+v.toFixed(2);try{localStorage.setItem('off_'+sy,OFF)}catch(e){}reset()}
+function matchPrice(){const v=+$('tvp').value;if(!v||!C.length)return;setOff(v-(C[C.length-1].c-OFF))}
+function clearOff(){setOff(0)}
+function reset(keep){tok++;loadOff();if(ws){try{ws.close()}catch(e){}}A=null;if(!keep){FP={};seen={};fit=1}ser.setData([]);bar();err('Loading Binance data...');init(tok)}
+async function init(tk){try{C=await getK();if(tk!==tok)return;ser.setData(C.map(x=>({time:x.t,open:x.o,high:x.h,low:x.l,close:x.c})));
+  if(!Object.keys(FP).length)fpStep=niceStep(avg(C.slice(-14).map(x=>x.h-x.l))/10);const a=analyzeAll(C.slice(0,-1),tf);if(!a)throw'Not enough data';A=a;if(fit){chart.timeScale().fitContent();fit=0}
+  loadSpec();p2();lay();side();$('load').style.display='none';lastMsg=0;startPoll(tk);const la=await backfill(tk);if(tk!==tok)return;startWS(tk,la);alerts()}
+ catch(e){if(tk===tok){err('⚠ '+e);setTimeout(()=>{if(tk===tok)init(tk)},5000)}}}
+
+// ---- Ask AI: server AI if key is set, otherwise rule-based explanation ----
+let chat=[],aiBusy=0;
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])).replace(/\n/g,'<br>');
+function aiRender(){$('chat').innerHTML=chat.slice(-6).map(m=>`<div class="${m.r==='u'?'cu':'ca'}">${esc(m.t)}</div>`).join('')+(aiBusy?'<div class="m">thinking...</div>':'');$('chat').scrollTop=1e9}
+function snap(){if(!A)return null;const q=p=>p&&{side:p.side,with_trend:p.aligned,zone:[p.ob.bot,p.ob.top],entry:p.entry,stop_loss:p.sl,targets:[p.tp1,p.tp2,p.tp3],liquidity_target:p.liq,rr_to_liquidity:+p.rr.toFixed(1),score_of_5:p.score,reasons:p.reasons},c=C.slice(-10);
+ return{symbol:SY[sy][2],timeframe:tf,price:A.last,bias:A.bias,last_break:A.brks.length?A.brks[A.brks.length-1].txt:null,buy_plan:q(A.buy),sell_plan:q(A.sell),volume_profile:{poc:A.vp.poc,vah:A.vp.vah,val:A.vp.val},delta_last_candle:C.length>1?2*C[C.length-2].b-C[C.length-2].v:0,delta_last_10:c.reduce((a,x)=>a+2*x.b-x.v,0),nearby_sr:A.sr.filter(s=>Math.abs(s.p-A.last)<8*A.atr).slice(0,6).map(s=>[+s.p.toFixed(2),s.n]),atr:+A.atr.toFixed(2)}}
+function explain(q){if(!A)return'Data abhi load ho raha hai.';
+ const s=/sell|short|bech/i.test(q),b=/buy|long|kharid/i.test(q),p=s&&!b?A.sell:b&&!s?A.buy:prim();
+ const bz=A.bias==='bull'?'BULLISH (higher highs/lows)':A.bias==='bear'?'BEARISH (lower highs/lows)':'RANGE (no clear trend)',cd=C.slice(-10).reduce((a,x)=>a+2*x.b-x.v,0);
+ let t=`Market abhi ${bz}${A.brks.length?', last break: '+A.brks[A.brks.length-1].txt:''}.\n`;
+ if(!p)return t+'Is side ke liye abhi koi fresh valid zone nahi hai (zone bana nahi, price ne tod diya, ya bahut door hai). Wait karna valid decision hai.';
+ t+=`${p.side} zone ${f(p.ob.bot)}-${f(p.ob.top)}: ye wo candle hai jahan se pichli baar price tez bhaga tha, isliye yahan dobara reaction aa sakta hai.\n`;
+ t+=p.aligned?'Ye zone trend ke saath hai, isliye relatively better setup.\n':'⚠ Ye trend ke KHILAF (counter-trend) hai, isliye risk zyada hai.\n';
+ if(p.reasons.length)t+='Confluence: '+p.reasons.join(', ')+` (grade ${p.score}/5).\n`;
+ t+=`Delta (last 10 candles) ${cd>=0?'buyers':'sellers'} ke favour me hai (${fv(cd)})`+((cd>=0)===(p.side==='BUY')?', jo is side ko support karta hai.':', jo is side ke against hai, isliye savdhan.')+'\n';
+ t+=`Plan: entry ${f(p.entry)}, SL ${f(p.sl)}, TP 1:2 ${f(p.tp2)}. Candle SL ke bahar close ho to idea galat. Volume POC ${f(A.vp.poc)}.\n`;
+ return t+'Ye guarantee nahi hai, sirf educational reading hai. Risk capital ka chhota hissa (0.5-2%) rakho.'}
+async function askAI(q){q=(q||$('aq').value).trim().slice(0,400);if(!q||aiBusy)return;$('aq').value='';chat.push({r:'u',t:q});aiBusy=1;aiRender();let ans=null,src='',er='';
+ try{const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,ctx:snap()})}),j=await r.json();if(j.answer){ans=j.answer;src='🤖 AI'}else if(j.error&&j.error!=='no_key')er=' ('+j.error+')'}catch(e){}
+ if(!ans){ans=explain(q);src='📘 Rule-based answer (AI key not connected)'+er}
+ chat.push({r:'a',t:src+'\n'+ans});aiBusy=0;aiRender()}
+
+
+// ---- demo account (simulated), diagnostics ----
+let AC=null,BK=null,SPEC={step:.00001,min:.00001,notional:5},tkS='BUY',lastLat=0,lastR=0;const SLIP=.0001;
+const SPECS={BTCUSDT:{step:.00001,min:.00001,notional:5},ETHUSDT:{step:.0001,min:.0001,notional:5},PAXGUSDT:{step:.0001,min:.0001,notional:5},XAUUSDT:{step:.001,min:.001,notional:5}};
+const PROV={spot:'Binance Spot',fut:'Binance Futures perpetual (XAUUSDT is NOT spot XAUUSD)'};
+try{AC=JSON.parse(localStorage.getItem('vk_acct'))}catch(e){}if(!AC||!AC.pos)AC=newAcct(100);
+const saveAc=()=>{try{localStorage.setItem('vk_acct',JSON.stringify(AC))}catch(e){}};
+async function loadSpec(){const[s,m]=SY[sy];SPEC=SPECS[s]||SPEC;if(m!=='spot')return;try{const j=await(await ft(`${HOST.spot[0]}/exchangeInfo?symbol=${s}`)).json(),F=j.symbols[0].filters,l=F.find(x=>x.filterType==='LOT_SIZE'),n=F.find(x=>x.filterType==='NOTIONAL'||x.filterType==='MIN_NOTIONAL');SPEC={step:+l.stepSize,min:+l.minQty,notional:+((n&&n.minNotional)||5)}}catch(e){}}
+function ba(){const l=C.length?C[C.length-1].c:0;if(BK&&Date.now()-BK.t<4000)return[BK.bid+OFF,BK.ask+OFF,1];const h=l*.00005;return[l-h,l+h,0]}
+setInterval(async()=>{try{const[s,m]=SY[sy],j=await(await ft(`${HOST[m][0]}/ticker/bookTicker?symbol=${s}`)).json();BK={bid:+j.bidPrice,ask:+j.askPrice,t:Date.now()}}catch(e){}},1000);
+function resetAc(){AC=newAcct($('d_b').value);$('d_b').value=AC.bal0;saveAc();acRender(1)}
+function tkSd(s){tkS=s;$('d_buy').className='b'+(s==='BUY'?' on':'');$('d_sell').className='b'+(s==='SELL'?' on':'');tkPv()}
+const gv=i=>+$(i).value;
+function tkRead(){const[b,a]=ba(),en=$('d_ty').value==='mkt'?(tkS==='BUY'?a:b):gv('d_e'),sl=gv('d_s'),tp=gv('d_t')||null,lev=gv('d_l')||1,sz=sizeQty(gv('d_r'),en,sl,SPEC);return{b,a,en,sl,tp,lev,sz,trail:$('d_n').checked?{act:gv('d_a')||1.1,lock:0}:null}}
+function tkPv(){const t=tkRead(),e=$('d_pv');if(!(t.sl>0))return e.textContent='Enter a stop loss to size the position.';if(t.sz.err)return e.innerHTML='<span class="r">'+t.sz.err+'</span>';
+ const bal=AC.bal,risk=t.sz.risk;e.innerHTML=`Qty ${t.sz.qty} · value $${f(t.sz.notional)} · margin $${f(t.sz.notional/t.lev)} · planned loss $${risk.toFixed(2)} (${(risk/bal*100).toFixed(1)}%) · fees ~$${(t.sz.notional*FEE*2).toFixed(2)}`+(risk/bal>=.1?'<br><span class="r">HIGH RISK: 10%+ of balance on one trade.</span>':'')+(t.tp?`<br>R:R ${(Math.abs(t.tp-t.en)/Math.abs(t.en-t.sl)).toFixed(2)}`:'')}
+function tkPlan(){const p=prim();if(!p)return notify('No main plan right now (NO TRADE).');tkSd(p.side);$('d_ty').value='lim';$('d_e').value=+p.entry.toFixed(2);$('d_s').value=+p.sl.toFixed(2);$('d_t').value=+p.tp2.toFixed(2);tkPv()}
+function tkGo(){const t=tkRead();if(t.sz.err||!(t.sl>0))return notify('Order rejected: '+(t.sz.err||'set stop loss'));const o={side:tkS,qty:t.sz.qty,sl:t.sl,tp:t.tp,trail:t.trail,sym:sy,price:t.en};
+ if($('d_ty').value==='lim'){AC.ord.push(o);notify('Demo limit order placed @ '+f(t.en))}else{const r=openPos(AC,o,t.b,t.a,t.lev,SLIP);if(r.err)return notify('Order rejected: '+r.err);notify(`Demo ${tkS} filled @ ${f(r.pos.entry)} (spread+slippage included)`)}saveAc();acRender(1)}
+function closeP(id){const p=AC.pos.find(x=>x.id===id);if(!p)return;const[b,a]=ba();notify('Closed #'+id+', P&L '+closePos(AC,p,markPx(p,b,a),'Manual',SLIP).toFixed(2));saveAc();acRender(1)}
+function cancelO(i){AC.ord.splice(i,1);saveAc();acRender(1)}
+function acctTick(){if(!C.length)return;const[b,a]=ba(),kp=AC.pos.filter(p=>p.sym!==sy),ko=AC.ord.filter(o=>o.sym!==sy);AC.pos=AC.pos.filter(p=>p.sym===sy);AC.ord=AC.ord.filter(o=>o.sym===sy);
+ const ev=stepAcct(AC,b,a,gv('d_l')||10,SLIP);AC.pos=AC.pos.concat(kp);AC.ord=AC.ord.concat(ko);if(ev.length){ev.forEach(x=>notify(x));saveAc()}if(ev.length||Date.now()-lastR>500)acRender()}
+function acRender(force){lastR=Date.now();if(!C.length)return;const[b,a]=ba(),cur=AC.pos.filter(p=>p.sym===sy),eq=AC.bal+cur.reduce((s,p)=>s+(markPx(p,b,a)-p.entry)*p.qty*dirOf(p.side),0),um=usedMargin(AC,gv('d_l')||10),w=AC.hist.filter(h=>h.pnl>0).length,net=AC.bal-AC.bal0;
+ $('acs').innerHTML=`<table><tr><td>Balance</td><td>$${AC.bal.toFixed(2)}</td></tr><tr><td>Equity (this symbol marked)</td><td class="${eq>=AC.bal?'g':'r'}">$${eq.toFixed(2)}</td></tr><tr><td>Used / free margin</td><td>$${um.toFixed(2)} / $${(eq-um).toFixed(2)}</td></tr><tr><td>Net P&L · trades · win rate</td><td class="${net>=0?'g':'r'}">${net.toFixed(2)} · ${AC.hist.length} · ${AC.hist.length?(w/AC.hist.length*100).toFixed(0):0}%</td></tr></table>`;
+ $('acp').innerHTML=AC.pos.map(p=>{const m=p.sym===sy?(markPx(p,b,a)-p.entry)*p.qty*dirOf(p.side):null;return`<div class="m">#${p.id} ${p.sym} ${p.side} ${p.qty} @ ${f(p.entry)} SL ${f(p.sl)} TP ${f(p.tp)} ${m==null?'(other symbol)':'<b class="'+(m>=0?'g':'r')+'">'+m.toFixed(2)+'</b>'} <span class="b" onclick="closeP(${p.id})">close</span>${p.log.length?'<br>↳ '+p.log[p.log.length-1]:''}</div>`}).join('')
+ +AC.ord.map((o,i)=>`<div class="m">pending ${o.sym} ${o.side} ${o.qty} @ ${f(o.price)} <span class="b" onclick="cancelO(${i})">cancel</span></div>`).join('')
+ +AC.hist.slice(0,4).map(h=>`<div class="m">done #${h.id} ${h.side} ${h.why} <span class="${h.pnl>=0?'g':'r'}">${h.pnl.toFixed(2)}</span></div>`).join('')}
+function diag(){const now=Date.now(),age=lastUpd?(now-lastUpd)/1000:99,live=now-lastMsg<4000,[b,a,ok]=ba(),last=C.length?C[C.length-1]:null,d=$('diag');if(!last)return;
+ const bad=age>8,mid=(b+a)/2,diff=ok?Math.abs(mid-last.c)/last.c*100:0;
+ d.innerHTML=`<b>${SY[sy][2]}</b> · Provider: ${PROV[SY[sy][1]]} · Feed: <span class="${live?'g':'a'}">${live?'websocket':'REST polling 1s'}</span> · last tick ${age.toFixed(1)}s ago · latency ~${lastLat}ms (browser vs exchange clock) · candle ${new Date(last.t*1000).toLocaleTimeString()} · bid ${f(b)} ask ${f(a)} spread ${f(a-b)}${ok?'':' (estimated, bookTicker unavailable)'}`
+ +(bad?' · <b class="r">STALE DATA / DISCONNECTED</b>':'')+(diff>.1?' · <b class="r">price discrepancy '+diff.toFixed(2)+'% between quote and candle</b>':'')+(OFF?` · <span class="a">display offset ${OFF>=0?'+':''}${OFF} applied</span>`:'')}
+setInterval(diag,500);tkPv();acRender(1);
+
+loadOff();bar();frame();init(tok);aiRender();
+
+</script></body></html>"""
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, body, ct):
+        self.send_response(200); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path.startswith("/health"): return self._send(b"ok", "text/plain")
+        self._send(HTML.encode(), "text/html; charset=utf-8")
+    def do_POST(self):
+        out = {"error": "bad request"}
+        try:
+            if self.path != "/api/ask": raise ValueError("not found")
+            n = int(self.headers.get("Content-Length", "0"))
+            if n > 20000: raise ValueError("too large")
+            d = json.loads(self.rfile.read(n) or b"{}")
+            if not KEY: out = {"error": "no_key"}
+            else:
+                ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+                now = time.time(); h = [t for t in HITS.get(ip, []) if now - t < 3600]
+                if len(h) >= LIMIT: out = {"error": "hourly AI limit reached, try later"}
+                else:
+                    h.append(now); HITS[ip] = h
+                    out = {"answer": ask_ai(str(d.get("q", "")), d.get("ctx"))}
+        except Exception as e:
+            out = {"error": str(e)[:200]}
+        self._send(json.dumps(out).encode(), "application/json")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000")); online = "PORT" in os.environ
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(("0.0.0.0" if online else "127.0.0.1", port), H) as s:
+        print(f"Running on port {port}  | AI: {'on' if KEY else 'off (no ANTHROPIC_API_KEY)'}")
+        if not online:
+            try: webbrowser.open(f"http://127.0.0.1:{port}")
+            except Exception: pass
+        s.serve_forever()
