@@ -33,7 +33,7 @@ input{width:100%;background:#0e1320;border:1px solid #232b3d;color:#fff;border-r
 #toast{position:fixed;right:12px;top:60px;z-index:20;display:flex;flex-direction:column;gap:6px}
 .t{background:#14102a;border:1px solid #7c3aed;border-radius:10px;padding:10px 12px;max-width:320px;box-shadow:0 6px 24px rgba(124,58,237,.4)}
 </style></head><body>
-<header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="dot" style="margin-left:auto;font-size:11px"></span><span id="px"></span></header>
+<header><div class="logo">VK</div><div class="row" id="syms"></div><div class="row" id="tfs"></div><span id="dot" style="margin-left:auto;font-size:11px"></span><span style="display:flex;gap:4px;align-items:center"><input id="tvp" type="number" step="any" placeholder="TV price" style="width:92px"><div class="b" onclick="matchPrice()">Match</div><div class="b" onclick="clearOff()">✕</div></span><span id="px"></span></header>
 <div class="chips row" id="chips"></div>
 <div class="main"><div><div id="wrap"><div id="c"></div><canvas id="ov"></canvas><div id="wm">VK</div><div id="load"><span id="lt">Loading Binance data...</span></div></div>
 <div id="p2w"><div id="c2"></div><div id="md"></div></div></div><aside id="side"></aside></div>
@@ -92,7 +92,7 @@ const SY={BTC:['BTCUSDT','spot','₿ BTC'],ETH:['ETHUSDT','spot','Ξ ETH'],XAU:[
 const TF={'1m':60,'5m':300,'15m':900,'1h':3600,'4h':14400,'1d':86400};
 const HOST={spot:['https://api.binance.com/api/v3','https://data-api.binance.vision/api/v3'],fut:['https://fapi.binance.com/fapi/v1']};
 const WSH={spot:'wss://stream.binance.com:443/stream?streams=',fut:'wss://fstream.binance.com/stream?streams='};
-let sy='BTC',tf='5m',C=[],A=null,FP={},fpStep=1,fpReady=0,ws=null,tok=0,p2m='Delta',seen={},log=[],sel='auto',fit=1;
+let OFF=0,sy='BTC',tf='5m',C=[],A=null,FP={},fpStep=1,fpReady=0,ws=null,tok=0,p2m='Delta',seen={},log=[],sel='auto',fit=1;
 const L={zones:1,plan:1,struct:1,sr:0,fib:0,vp:0,fp:0,both:0,vol:1};
 const CHIPS=[['zones','🟩 Zones'],['plan','🎯 Plan'],['struct','🧱 Structure'],['sr','📏 S/R'],['fib','🌀 Fib'],['vp','🧬 Volume Profile'],['fp','⚡ Footprint'],['both','↔ Both sides'],['alert','🔔 Alerts']];
 const f=n=>n==null?'-':(+n).toLocaleString(undefined,{maximumFractionDigits:Math.abs(n)>=1000?2:Math.abs(n)>=1?3:5});
@@ -151,7 +151,7 @@ function side(){if(!A){$('side').innerHTML='';return}
   <tr><td>Size (units) / value</td><td>${u.toFixed(5)} / $${f(u*p.entry)}</td></tr><tr><td>Leverage needed</td><td>${(u*p.entry/bal).toFixed(1)}x</td></tr></table><div class="m">${p.reasons.join(' · ')||'no extra confluence'}</div></div>`};
  const keep=document.activeElement&&document.activeElement.id;
  $('side').innerHTML=`<div class="card"><h3>Market: <span class="tag ${A.bias}">${A.bias==='bull'?'BULLISH':A.bias==='bear'?'BEARISH':'RANGE'}</span> ${A.brks.length?'<span class="tag rng">'+A.brks.slice(-1)[0].txt+'</span>':''}</h3>
- <table><tr><td>Volume POC (fixed per session)</td><td class="a">${f(v.poc)}</td></tr><tr><td>Value area</td><td>${f(v.val)} – ${f(v.vah)}</td></tr><tr><td>Last candle delta</td><td class="${d1>=0?'g':'r'}">${fv(d1)}</td></tr><tr><td>Delta (last 10)</td><td class="${cd>=0?'g':'r'}">${fv(cd)}</td></tr></table></div>`
+ <table><tr><td>Price offset (match)</td><td>${OFF>=0?'+':''}${OFF}</td></tr><tr><td>Volume POC (fixed per session)</td><td class="a">${f(v.poc)}</td></tr><tr><td>Value area</td><td>${f(v.val)} – ${f(v.vah)}</td></tr><tr><td>Last candle delta</td><td class="${d1>=0?'g':'r'}">${fv(d1)}</td></tr><tr><td>Delta (last 10)</td><td class="${cd>=0?'g':'r'}">${fv(cd)}</td></tr></table></div>`
  +(p?pc(p,p.side==='BUY'?'Buy plan':'Sell plan')+(L.both?pc(p===A.buy?A.sell:A.buy,'Other side'):''):'<div class="card"><h3>Range market</h3><p class="m">No clear trend, so no main plan. Both sides shown below for reference.</p></div>'+pc(A.buy,'Buy plan')+pc(A.sell,'Sell plan'))
  +`<div class="card"><h3>🧮 Risk</h3><div style="display:flex;gap:6px"><div><span class="m">Balance $</span><input id="bal" type="number" value="${bal}"></div><div><span class="m">Risk %</span><input id="rp" type="number" value="${rp}"></div></div>${rp>=5?`<p class="r">High risk: 5 losses in a row = about -${((1-Math.pow(1-rp/100,5))*100).toFixed(0)}% of account.</p>`:''}</div>`
  +`<div class="card"><h3>🔔 Alerts ${L.alert?'(on)':'(off, tap chip)'}</h3>${log.slice(0,6).map(x=>'<div class="m">'+x+'</div>').join('')||'<div class="m">Nothing yet. Alerts fire when a new zone forms and when price enters it.</div>'}</div>`;
@@ -164,15 +164,15 @@ function alerts(){if(!A)return;const k=SY[sy][2]+' '+tf;[A.buy,A.sell].forEach(p
   const c=C[C.length-1];if(!seen[id+'t']&&c.l<=p.ob.top&&c.h>=p.ob.bot){seen[id+'t']=1;notify(`${k}: price ENTERED ${p.side} zone. Entry ${f(p.entry)} SL ${f(p.sl)}`)}})}
 // ---- data ----
 const err=m=>{$('load').style.display='flex';$('lt').textContent=m};
-async function getK(){const[s,m]=SY[sy],es=[];for(const h of HOST[m]){try{const r=await fetch(`${h}/klines?symbol=${s}&interval=${tf}&limit=1000`);if(!r.ok)throw'HTTP '+r.status;return(await r.json()).map(x=>({t:x[0]/1000,o:+x[1],h:+x[2],l:+x[3],c:+x[4],v:+x[5],b:+x[9]}))}catch(e){es.push(h.split('/')[2]+': '+e)}}throw es.join(' | ')+'. Binance may be blocked on this network (try another network/VPN).'}
-function fpAdd(d){const t=Math.floor(d.T/1000/TF[tf])*TF[tf],k=Math.round(+d.p/fpStep),m=FP[t]||(FP[t]=new Map()),v=m.get(k)||[0,0];v[d.m?0:1]+=+d.q;m.set(k,v)}
+async function getK(){const[s,m]=SY[sy],es=[];for(const h of HOST[m]){try{const r=await fetch(`${h}/klines?symbol=${s}&interval=${tf}&limit=1000`);if(!r.ok)throw'HTTP '+r.status;return(await r.json()).map(x=>({t:x[0]/1000,o:+x[1]+OFF,h:+x[2]+OFF,l:+x[3]+OFF,c:+x[4]+OFF,v:+x[5],b:+x[9]}))}catch(e){es.push(h.split('/')[2]+': '+e)}}throw es.join(' | ')+'. Binance may be blocked on this network (try another network/VPN).'}
+function fpAdd(d){const t=Math.floor(d.T/1000/TF[tf])*TF[tf],k=Math.round((+d.p+OFF)/fpStep),m=FP[t]||(FP[t]=new Map()),v=m.get(k)||[0,0];v[d.m?0:1]+=+d.q;m.set(k,v)}
 async function backfill(tk){const[s,m]=SY[sy],h=HOST[m][0];let from=null,last=0;
  for(let i=0;i<8&&tk===tok;i++){try{const u=from==null?`${h}/aggTrades?symbol=${s}&startTime=${C[C.length-1].t*1000}&limit=1000`:`${h}/aggTrades?symbol=${s}&fromId=${from}&limit=1000`;const r=await (await fetch(u)).json();if(!Array.isArray(r)||!r.length)break;
   r.forEach(d=>{if(d.T>=C[C.length-1].t*1000)fpAdd(d);last=d.a});from=last+1;if(r.length<1000)break}catch(e){break}}return last}
 function startWS(tk,lastA){lastMsg=0;startPoll(tk);const[s,m]=SY[sy],q=s.toLowerCase();ws=new WebSocket(WSH[m]+`${q}@kline_${tf}/${q}@aggTrade`);
  ws.onmessage=e=>{if(tk!==tok)return;const j=JSON.parse(e.data),d=j.data;if(!d)return;
   lastMsg=Date.now();if(d.e==='aggTrade'){if(d.a>lastA){lastA=d.a;fpAdd(d)}return}
-  const k=d.k;onK({t:k.t/1000,o:+k.o,h:+k.h,l:+k.l,c:+k.c,v:+k.v,b:+k.V},k.x)};
+  const k=d.k;onK({t:k.t/1000,o:+k.o+OFF,h:+k.h+OFF,l:+k.l+OFF,c:+k.c+OFF,v:+k.v,b:+k.V},k.x)};
  ws.onclose=()=>{if(tk===tok)setTimeout(()=>{if(tk===tok)reset(1)},2000)}}
 let lastMsg=0,poll=null;
 function onK(c,x){const l=C[C.length-1];if(l.t===c.t)C[C.length-1]=c;else if(c.t>l.t){C.push(c);if(C.length>1500)C.shift()}else return;
@@ -181,15 +181,19 @@ function onK(c,x){const l=C[C.length-1];if(l.t===c.t)C[C.length-1]=c;else if(c.t
  if(x){recalc();p2()}else if(A){A.last=c.c;alerts()}}
 function setDot(live){$('dot').innerHTML=live?'<span class="g">● LIVE</span>':'<span class="a">● POLLING (websocket blocked, REST every 2s)</span>'}
 function startPoll(tk){clearInterval(poll);const[s,m]=SY[sy];poll=setInterval(async()=>{if(tk!==tok)return clearInterval(poll);const live=Date.now()-lastMsg<4000;setDot(live);if(live)return;
- try{const r=await(await fetch(`${HOST[m][0]}/klines?symbol=${s}&interval=${tf}&limit=2`)).json(),q=r.map(x=>({t:x[0]/1000,o:+x[1],h:+x[2],l:+x[3],c:+x[4],v:+x[5],b:+x[9]}));
+ try{const r=await(await fetch(`${HOST[m][0]}/klines?symbol=${s}&interval=${tf}&limit=2`)).json(),q=r.map(x=>({t:x[0]/1000,o:+x[1]+OFF,h:+x[2]+OFF,l:+x[3]+OFF,c:+x[4]+OFF,v:+x[5],b:+x[9]}));
   onK(q[0],false);const n0=C.length;onK(q[1],false);if(C.length>n0){recalc();p2()}}catch(e){}},2000)}
 function recalc(){const D=C.slice(0,-1),a=analyzeAll(D,tf);if(a){A=a;lay();side();alerts()}}   // analysis only on CLOSED candles: nothing shifts mid-candle
-function reset(keep){tok++;if(ws){try{ws.close()}catch(e){}}A=null;if(!keep){FP={};seen={};fit=1}ser.setData([]);bar();err('Loading Binance data...');init(tok)}
+function loadOff(){try{OFF=+localStorage.getItem('off_'+sy)||0}catch(e){OFF=0}}
+function setOff(v){OFF=+v.toFixed(2);try{localStorage.setItem('off_'+sy,OFF)}catch(e){}reset()}
+function matchPrice(){const v=+$('tvp').value;if(!v||!C.length)return;setOff(v-(C[C.length-1].c-OFF))}
+function clearOff(){setOff(0)}
+function reset(keep){tok++;loadOff();if(ws){try{ws.close()}catch(e){}}A=null;if(!keep){FP={};seen={};fit=1}ser.setData([]);bar();err('Loading Binance data...');init(tok)}
 async function init(tk){try{C=await getK();if(tk!==tok)return;ser.setData(C.map(x=>({time:x.t,open:x.o,high:x.h,low:x.l,close:x.c})));
   if(!Object.keys(FP).length)fpStep=niceStep(avg(C.slice(-14).map(x=>x.h-x.l))/10);const a=analyzeAll(C.slice(0,-1),tf);if(!a)throw'Not enough data';A=a;if(fit){chart.timeScale().fitContent();fit=0}
   p2();lay();side();$('load').style.display='none';const la=await backfill(tk);if(tk!==tok)return;startWS(tk,la);alerts()}
  catch(e){if(tk===tok){err('⚠ '+e);setTimeout(()=>{if(tk===tok)init(tk)},5000)}}}
-bar();frame();init(tok);
+loadOff();bar();frame();init(tok);
 
 </script></body></html>"""
 
